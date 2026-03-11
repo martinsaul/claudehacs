@@ -2,7 +2,7 @@ name: Claude Code
 description: Claude CLI terminal accessible from the Home Assistant sidebar
 version: 1.0.0
 slug: claude-code
-url: https://github.com/yourusername/claudehaos
+url: https://github.com/martinsaul/claudehacs
 startup: application
 boot: auto
 ingress: true
@@ -11,6 +11,10 @@ ingress_stream: true
 panel_icon: mdi:robot
 panel_title: Claude
 homeassistant_api: true
+hassio_api: true
+hassio_role: manager
+auth_api: false
+full_access: false
 arch:
   - amd64
   - aarch64

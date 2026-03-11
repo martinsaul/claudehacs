@@ -28,6 +28,10 @@ export HOME="/data"
 # Ensure Claude config directory exists
 mkdir -p "${HOME}/.claude"
 
+# Expose Supervisor API token so Claude can call HA/Supervisor REST APIs
+# e.g. curl -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/core/api/services
+export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
+
 # Set the working directory to HA config
 cd /config || exit 1
 
