@@ -2,25 +2,25 @@ ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Install runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     bash \
     curl \
     jq \
     openssh-client \
-    ttyd \
     tmux \
-    libgcc \
-    libstdc++ \
-    ripgrep
+    ripgrep \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ttyd
+RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd \
+    && chmod +x /usr/local/bin/ttyd
 
 # Install Claude CLI via native installer
 ENV HOME=/root
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:$PATH"
-
-# Use system ripgrep (musl-compatible)
-ENV USE_BUILTIN_RIPGREP=0
 
 # Copy entrypoint
 COPY run.sh /run.sh
