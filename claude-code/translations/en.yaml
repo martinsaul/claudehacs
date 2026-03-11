@@ -1,0 +1,6 @@
+configuration:
+  anthropic_api_key:
+    name: Anthropic API Key
+    description: >-
+      Your Anthropic API key. Leave blank to use OAuth authentication
+      (recommended).
