@@ -21,10 +21,8 @@ RUN npm install -g @anthropic-ai/claude-code
 # Clean up build dependencies
 RUN apk del make g++
 
-# Copy root filesystem
-COPY run.sh /run.sh
-RUN chmod a+x /run.sh
+# Copy s6 service definition
+COPY run.sh /etc/services.d/claude-code/run
+RUN chmod a+x /etc/services.d/claude-code/run
 
 WORKDIR /config
-
-CMD ["/run.sh"]
