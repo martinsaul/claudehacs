@@ -44,5 +44,4 @@ exec ttyd \
     --base-path "${INGRESS_ENTRY}" \
     --ping-interval 30 \
     --max-clients 3 \
-    --title-fixed "Claude Code" \
     bash -c 'echo "Welcome to Claude Code for Home Assistant"; echo "Working directory: $(pwd)"; echo "---"; exec claude'

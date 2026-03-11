@@ -1,6 +1,6 @@
 name: Claude Code
 description: Claude CLI terminal accessible from the Home Assistant sidebar
-version: 1.0.1
+version: 1.0.2
 slug: claude-code
 url: https://github.com/martinsaul/claudehacs
 startup: application
