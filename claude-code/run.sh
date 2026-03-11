@@ -3,7 +3,7 @@ set -e
 
 # ==============================================================================
 # Claude Code Add-on: Entrypoint
-# Launches ttyd serving Claude CLI on the ingress port
+# Launches ttyd serving Claude CLI via tmux for session persistence
 # ==============================================================================
 
 # Read addon options
@@ -25,6 +25,10 @@ fi
 export HOME="/data"
 mkdir -p "${HOME}/.claude"
 
+# Ensure claude binary is on PATH
+export PATH="/root/.local/bin:$PATH"
+export USE_BUILTIN_RIPGREP=0
+
 # Expose Supervisor API token for HA API calls
 export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
 
@@ -37,11 +41,31 @@ INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
 
 echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
 
-# Launch ttyd with Claude CLI
+# Create a wrapper script that attaches to or creates a tmux session
+cat > /tmp/claude-tmux.sh << 'WRAPPER'
+#!/bin/bash
+export HOME="/data"
+export PATH="/root/.local/bin:$PATH"
+export USE_BUILTIN_RIPGREP=0
+export TERM=xterm-256color
+cd /config
+
+SESSION="claude"
+
+# If tmux session exists, attach to it; otherwise create one running claude
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+else
+    exec tmux new-session -s "$SESSION" claude
+fi
+WRAPPER
+chmod +x /tmp/claude-tmux.sh
+
+# Launch ttyd with the tmux wrapper
 exec ttyd \
     --writable \
     --port "${INGRESS_PORT}" \
     --base-path "${INGRESS_ENTRY}" \
     --ping-interval 30 \
-    --max-clients 3 \
-    bash -c 'echo "Welcome to Claude Code for Home Assistant"; echo "Working directory: $(pwd)"; echo "---"; exec claude'
+    --max-clients 0 \
+    /tmp/claude-tmux.sh

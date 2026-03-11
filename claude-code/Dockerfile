@@ -1,25 +1,26 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Install Node.js and build dependencies
+# Install runtime dependencies
 RUN apk add --no-cache \
-    nodejs \
-    npm \
     git \
     bash \
     curl \
     jq \
     openssh-client \
     ttyd \
-    python3 \
-    make \
-    g++
+    tmux \
+    libgcc \
+    libstdc++ \
+    ripgrep
 
-# Install Claude CLI globally
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude CLI via native installer
+ENV HOME=/root
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/root/.local/bin:$PATH"
 
-# Clean up build dependencies
-RUN apk del make g++
+# Use system ripgrep (musl-compatible)
+ENV USE_BUILTIN_RIPGREP=0
 
 # Copy entrypoint
 COPY run.sh /run.sh
