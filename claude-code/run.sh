@@ -1,49 +1,47 @@
-#!/usr/bin/with-contenv bashio
-# shellcheck shell=bash
+#!/bin/bash
+set -e
 
 # ==============================================================================
 # Claude Code Add-on: Entrypoint
 # Launches ttyd serving Claude CLI on the ingress port
 # ==============================================================================
 
-declare INGRESS_PORT
-declare API_KEY
-
-# Read ingress port from supervisor
-INGRESS_PORT=$(bashio::addon.ingress_port)
-bashio::log.info "Starting Claude Code on ingress port ${INGRESS_PORT}..."
-
-# Set API key from addon options if provided
-API_KEY=$(bashio::config 'anthropic_api_key' '')
-if bashio::var.has_value "${API_KEY}"; then
-    export ANTHROPIC_API_KEY="${API_KEY}"
-    bashio::log.info "Anthropic API key configured from addon options."
-else
-    bashio::log.info "No API key set in options. Claude will use OAuth or prompt for authentication."
+# Read addon options
+OPTIONS_FILE="/data/options.json"
+API_KEY=""
+if [ -f "${OPTIONS_FILE}" ]; then
+    API_KEY=$(jq -r '.anthropic_api_key // empty' "${OPTIONS_FILE}")
 fi
 
-# Set HOME so Claude CLI can persist config/auth
-export HOME="/data"
+# Set API key if provided
+if [ -n "${API_KEY}" ]; then
+    export ANTHROPIC_API_KEY="${API_KEY}"
+    echo "Anthropic API key configured from addon options."
+else
+    echo "No API key set. Claude will use OAuth or prompt for authentication."
+fi
 
-# Ensure Claude config directory exists
+# Set HOME for Claude CLI config persistence
+export HOME="/data"
 mkdir -p "${HOME}/.claude"
 
-# Expose Supervisor API token so Claude can call HA/Supervisor REST APIs
-# e.g. curl -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/core/api/services
+# Expose Supervisor API token for HA API calls
 export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
 
-# Set the working directory to HA config
+# Working directory
 cd /config || exit 1
 
+# Read ingress port and entry from supervisor
+INGRESS_PORT="${INGRESS_PORT:-7681}"
+INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
+
+echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
+
 # Launch ttyd with Claude CLI
-# --writable: allow input
-# --port: bind to ingress port
-# --base-path: set base path for ingress compatibility
-# --credential: no auth needed, HA ingress handles it
 exec ttyd \
     --writable \
     --port "${INGRESS_PORT}" \
-    --base-path "$(bashio::addon.ingress_entry)" \
+    --base-path "${INGRESS_ENTRY}" \
     --ping-interval 30 \
     --max-clients 3 \
     --title-fixed "Claude Code" \

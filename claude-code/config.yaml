@@ -5,6 +5,7 @@ slug: claude-code
 url: https://github.com/martinsaul/claudehacs
 startup: application
 boot: auto
+init: false
 ingress: true
 ingress_port: 7681
 ingress_stream: true

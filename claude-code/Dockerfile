@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/hassio-addons/base:17.2.4
+ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 # Install Node.js and build dependencies
@@ -21,8 +21,10 @@ RUN npm install -g @anthropic-ai/claude-code
 # Clean up build dependencies
 RUN apk del make g++
 
-# Copy s6 service definition
-COPY run.sh /etc/services.d/claude-code/run
-RUN chmod a+x /etc/services.d/claude-code/run
+# Copy entrypoint
+COPY run.sh /run.sh
+RUN chmod a+x /run.sh
 
 WORKDIR /config
+
+ENTRYPOINT ["/run.sh"]
