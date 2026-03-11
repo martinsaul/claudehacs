@@ -23,7 +23,6 @@ map:
   - ssl:ro
   - media:rw
   - share:rw
-  - addon_config:rw
 options:
   anthropic_api_key: ""
 schema:
