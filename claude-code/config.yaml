@@ -1,6 +1,6 @@
 name: Claude Code
 description: Claude CLI terminal accessible from the Home Assistant sidebar
-version: 1.1.1
+version: 1.2.0
 slug: claude-code
 url: https://github.com/martinsaul/claudehacs
 startup: application
@@ -26,7 +26,9 @@ map:
   - share:rw
 options:
   anthropic_api_key: ""
+  dangerously_skip_permissions: false
 schema:
   anthropic_api_key: str?
+  dangerously_skip_permissions: bool
 environment:
   PYTHONDONTWRITEBYTECODE: "1"

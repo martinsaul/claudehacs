@@ -4,3 +4,11 @@ configuration:
     description: >-
       Your Anthropic API key. Leave blank to use OAuth authentication
       (recommended).
+  dangerously_skip_permissions:
+    name: Dangerously Skip Permissions
+    description: >-
+      WARNING: This disables ALL permission prompts, allowing Claude to execute
+      any command, modify any file, and make any system change without asking
+      for confirmation. You accept full responsibility for any consequences,
+      including data loss, broken configurations, or unintended changes to your
+      Home Assistant system. Use at your own risk.

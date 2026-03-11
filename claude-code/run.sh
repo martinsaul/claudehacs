@@ -9,8 +9,10 @@ set -e
 # Read addon options
 OPTIONS_FILE="/data/options.json"
 API_KEY=""
+SKIP_PERMISSIONS=false
 if [ -f "${OPTIONS_FILE}" ]; then
     API_KEY=$(jq -r '.anthropic_api_key // empty' "${OPTIONS_FILE}")
+    SKIP_PERMISSIONS=$(jq -r '.dangerously_skip_permissions // false' "${OPTIONS_FILE}")
 fi
 
 # Set API key if provided
@@ -41,11 +43,18 @@ INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
 
 echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
 
+# Build claude command with optional flags
+CLAUDE_CMD="claude"
+if [ "${SKIP_PERMISSIONS}" = "true" ]; then
+    CLAUDE_CMD="claude --dangerously-skip-permissions"
+    echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
+fi
+
 # Create a wrapper script that attaches to or creates a tmux session
-cat > /tmp/claude-tmux.sh << 'WRAPPER'
+cat > /tmp/claude-tmux.sh << WRAPPER
 #!/bin/bash
 export HOME="/data"
-export PATH="/root/.local/bin:$PATH"
+export PATH="/root/.local/bin:\$PATH"
 export USE_BUILTIN_RIPGREP=0
 export TERM=xterm-256color
 cd /config
@@ -53,10 +62,10 @@ cd /config
 SESSION="claude"
 
 # If tmux session exists, attach to it; otherwise create one running claude
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    exec tmux attach-session -t "$SESSION"
+if tmux has-session -t "\$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "\$SESSION"
 else
-    exec tmux new-session -s "$SESSION" claude
+    exec tmux new-session -s "\$SESSION" ${CLAUDE_CMD}
 fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
