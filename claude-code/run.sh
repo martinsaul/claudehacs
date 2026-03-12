@@ -47,6 +47,14 @@ echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTR
 export CLAUDE_EXTRA_FLAGS=""
 if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     export CLAUDE_EXTRA_FLAGS="--dangerously-skip-permissions"
+    # Pre-accept the dangerous mode prompt so claude doesn't exit waiting for input
+    SETTINGS_FILE="${HOME}/.claude/settings.json"
+    if [ -f "${SETTINGS_FILE}" ]; then
+        jq '.skipDangerousModePermissionPrompt = true' "${SETTINGS_FILE}" > "${SETTINGS_FILE}.tmp" \
+            && mv "${SETTINGS_FILE}.tmp" "${SETTINGS_FILE}"
+    else
+        echo '{"skipDangerousModePermissionPrompt":true}' > "${SETTINGS_FILE}"
+    fi
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
 fi
 
