@@ -66,7 +66,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 else
     # shellcheck disable=SC2086
-    exec tmux new-session -s "$SESSION" claude $CLAUDE_EXTRA_FLAGS
+    exec tmux new-session -s "$SESSION" "claude $CLAUDE_EXTRA_FLAGS"
 fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
