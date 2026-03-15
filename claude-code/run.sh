@@ -82,13 +82,15 @@ cd /config
 
 SESSION="claude"
 
-# If tmux session exists, attach to it; otherwise create one running claude
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    exec tmux attach-session -t "$SESSION"
-else
-    # shellcheck disable=SC2086
-    exec tmux new-session -s "$SESSION" "su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:\$PATH && export USE_BUILTIN_RIPGREP=0 && cd /config && claude $CLAUDE_EXTRA_FLAGS' claude"
-fi
+# --- Debug: test claude as non-root user ---
+echo "=== CLAUDE-DEBUG $(date) ===" >&2
+echo "whoami: $(whoami)" >&2
+echo "Testing claude as claude user..." >&2
+su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:$PATH && echo "running as: $(whoami)" && which claude && claude --version && claude --dangerously-skip-permissions -p "say hello"' claude 2>&1 | tee /dev/stderr || true
+echo "--- EXIT CODE: $? ---" >&2
+echo "Debug complete. Press enter to continue..."
+read
+# --- End debug ---
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
 
