@@ -85,8 +85,15 @@ SESSION="claude"
 # --- Debug: test claude as non-root user ---
 echo "=== CLAUDE-DEBUG $(date) ===" >&2
 echo "whoami: $(whoami)" >&2
+echo "Contents of /usr/local/share/claude-bin:" >&2
+ls -la /usr/local/share/claude-bin/ >&2 || echo "DIR NOT FOUND" >&2
+echo "Contents of /root/.local/bin:" >&2
+ls -la /root/.local/bin/ >&2 || echo "DIR NOT FOUND" >&2
+echo "File type of claude:" >&2
+file /root/.local/bin/claude >&2 || true
+echo "---" >&2
 echo "Testing claude as claude user..." >&2
-su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:$PATH && echo "running as: $(whoami)" && which claude && claude --version && claude --dangerously-skip-permissions -p "say hello"' claude 2>&1 | tee /dev/stderr || true
+su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:$PATH && echo "running as: $(whoami)" && echo "PATH: $PATH" && which claude 2>&1 && claude --version 2>&1 && claude --dangerously-skip-permissions -p "say hello" 2>&1' claude 2>&1 | tee /dev/stderr || true
 echo "--- EXIT CODE: $? ---" >&2
 echo "Debug complete. Press enter to continue..."
 read
