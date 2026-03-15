@@ -86,10 +86,12 @@ cd /config
 
 SESSION="claude"
 
-# --- Debug ---
-echo "=== CLAUDE-DEBUG $(date) ===" >&2
-su -s /bin/bash -c 'ls -la /root/.local/bin/claude && ls -la /root/.local/share/claude/versions/ && ls -la /root/.local/share/claude/versions/2.1.76 && /root/.local/share/claude/versions/2.1.76 --version' claude 2>&1 | tee /dev/stderr || true
-echo "--- END DEBUG ---" >&2
+# --- Debug (output to stdout so it stays in the ttyd terminal) ---
+echo "=== CLAUDE-DEBUG $(date) ==="
+su -s /bin/bash -c 'echo "whoami: $(whoami)" && ls -la /root/.local/bin/claude 2>&1 && ls -la /root/.local/share/claude/versions/ 2>&1 && ls -la /root/.local/share/claude/versions/2.1.76 2>&1 && echo "---trying to run claude---" && claude --version 2>&1 && echo "---trying dangerously-skip-permissions---" && claude --dangerously-skip-permissions -p "say hello" 2>&1' claude || true
+echo "=== END DEBUG ==="
+echo "Press enter to continue..."
+read
 # --- End Debug ---
 
 # If tmux session exists, attach to it; otherwise create one running claude
