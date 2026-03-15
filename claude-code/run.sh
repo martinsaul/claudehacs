@@ -27,8 +27,8 @@ fi
 export HOME="/data"
 mkdir -p "${HOME}/.claude"
 
-# Ensure claude binary is on PATH
-export PATH="/root/.local/bin:$PATH"
+# Ensure claude binary is on PATH (use shared location accessible to non-root user)
+export PATH="/usr/local/share/claude-bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 
 # Expose Supervisor API token for HA API calls
@@ -59,14 +59,18 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
 fi
 
 # Kill stale tmux sessions to ensure a clean process tree
-# (prevents inherited CLAUDECODE env vars from surviving addon restarts)
 tmux kill-server 2>/dev/null || true
 
-# Create a wrapper script that attaches to or creates a tmux session
+# Grant the claude user access to necessary directories
+chown -R claude:claude /data/.claude
+chmod -R 755 /config
+chown -R claude:claude /home/claude
+
+# Create a wrapper script that runs as the non-root 'claude' user via tmux
 cat > /tmp/claude-tmux.sh << 'WRAPPER'
 #!/bin/bash
 export HOME="/data"
-export PATH="/root/.local/bin:$PATH"
+export PATH="/usr/local/share/claude-bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 export TERM=xterm-256color
 
@@ -76,22 +80,19 @@ unset CLAUDE_CODE_ENTRYPOINT
 
 cd /config
 
-# --- Debug: run claude non-interactively to capture output ---
-echo "=== CLAUDE-DEBUG $(date) ===" >&2
-echo "Testing claude with a simple prompt..." >&2
-claude --dangerously-skip-permissions -p "say hello" 2>&1 | tee /dev/stderr || true
-echo "--- CLAUDE EXIT CODE: $? ---" >&2
-echo "ENV:" >&2
-env | sort >&2
-echo "---" >&2
-# Keep the terminal alive so we can read the output
-echo "Debug complete. Press enter to continue..."
-read
-# --- End debug ---
+SESSION="claude"
+
+# If tmux session exists, attach to it; otherwise create one running claude
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+else
+    # shellcheck disable=SC2086
+    exec tmux new-session -s "$SESSION" "su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:\$PATH && export USE_BUILTIN_RIPGREP=0 && cd /config && claude $CLAUDE_EXTRA_FLAGS' claude"
+fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
 
-# Belt-and-suspenders: also unset nesting-detection vars in the parent process
+# Belt-and-suspenders: unset nesting-detection vars
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
 
