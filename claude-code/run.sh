@@ -43,10 +43,10 @@ INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
 
 echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
 
-# Build claude flags
-export CLAUDE_EXTRA_FLAGS=""
+# Build claude command
+CLAUDE_CMD="claude"
 if [ "${SKIP_PERMISSIONS}" = "true" ]; then
-    export CLAUDE_EXTRA_FLAGS="--dangerously-skip-permissions"
+    CLAUDE_CMD="claude --dangerously-skip-permissions"
     # Pre-accept the dangerous mode prompt so claude doesn't exit waiting for input
     SETTINGS_FILE="${HOME}/.claude/settings.json"
     if [ -f "${SETTINGS_FILE}" ]; then
@@ -56,19 +56,26 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
         echo '{"skipDangerousModePermissionPrompt":true}' > "${SETTINGS_FILE}"
     fi
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
+
+    # --dangerously-skip-permissions is blocked as root; drop to non-root user via gosu
+    # Grant claude user access to necessary directories
+    chown -R claude:claude /data/.claude
+    chown -R claude:claude /home/claude
+
+    export CLAUDE_USE_GOSU=1
+else
+    export CLAUDE_USE_GOSU=0
 fi
 
 # Kill stale tmux sessions to ensure a clean process tree
 tmux kill-server 2>/dev/null || true
 
-# Grant the claude user access to necessary directories
-chown -R claude:claude /data/.claude
-chmod -R 755 /config
-chown -R claude:claude /home/claude
-
 # Prevent Claude Code from detecting a "nested" invocation
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
+
+# Export the claude command for use in the wrapper
+export CLAUDE_CMD
 
 # Create a wrapper script that attaches to or creates a tmux session
 cat > /tmp/claude-tmux.sh << 'WRAPPER'
@@ -86,21 +93,15 @@ cd /config
 
 SESSION="claude"
 
-# --- Debug (output to stdout so it stays in the ttyd terminal) ---
-echo "=== CLAUDE-DEBUG $(date) ==="
-su -s /bin/bash -c 'echo "whoami: $(whoami)" && ls -la /root/.local/bin/claude 2>&1 && ls -la /root/.local/share/claude/versions/ 2>&1 && ls -la /root/.local/share/claude/versions/2.1.76 2>&1 && echo "---trying to run claude---" && claude --version 2>&1 && echo "---trying dangerously-skip-permissions---" && claude --dangerously-skip-permissions -p "say hello" 2>&1' claude || true
-echo "=== END DEBUG ==="
-echo "Press enter to continue..."
-read
-# --- End Debug ---
-
-# If tmux session exists, attach to it; otherwise create one running claude
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 else
-    # Run claude as non-root user (--dangerously-skip-permissions is blocked as root)
-    # shellcheck disable=SC2086
-    exec tmux new-session -s "$SESSION" "su -s /bin/bash -c 'export HOME=/data && export PATH=/root/.local/bin:\$PATH && export USE_BUILTIN_RIPGREP=0 && export TERM=xterm-256color && unset CLAUDECODE && unset CLAUDE_CODE_ENTRYPOINT && cd /config && claude $CLAUDE_EXTRA_FLAGS' claude"
+    if [ "$CLAUDE_USE_GOSU" = "1" ]; then
+        # Drop privileges for --dangerously-skip-permissions
+        exec tmux new-session -s "$SESSION" "gosu claude $CLAUDE_CMD"
+    else
+        exec tmux new-session -s "$SESSION" "$CLAUDE_CMD"
+    fi
 fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
