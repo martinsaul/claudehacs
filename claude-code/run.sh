@@ -76,16 +76,15 @@ unset CLAUDE_CODE_ENTRYPOINT
 
 cd /config
 
-# --- Debug: dump env and test claude ---
-LOG="/data/claude-debug.log"
-echo "=== $(date) ===" >> "$LOG"
-echo "ENV:" >> "$LOG"
-env | sort >> "$LOG"
-echo "---" >> "$LOG"
-echo "which claude: $(which claude 2>&1)" >> "$LOG"
-echo "claude version: $(claude --version 2>&1)" >> "$LOG"
-echo "CLAUDE_EXTRA_FLAGS: '$CLAUDE_EXTRA_FLAGS'" >> "$LOG"
-echo "---" >> "$LOG"
+# --- Debug: dump env and test claude to stderr (visible in HA addon logs) ---
+echo "=== CLAUDE-DEBUG $(date) ===" >&2
+echo "ENV:" >&2
+env | sort >&2
+echo "---" >&2
+echo "which claude: $(which claude 2>&1)" >&2
+echo "claude version: $(claude --version 2>&1)" >&2
+echo "CLAUDE_EXTRA_FLAGS: '$CLAUDE_EXTRA_FLAGS'" >&2
+echo "---" >&2
 # --- End debug ---
 
 SESSION="claude"
