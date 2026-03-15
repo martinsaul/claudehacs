@@ -76,6 +76,18 @@ unset CLAUDE_CODE_ENTRYPOINT
 
 cd /config
 
+# --- Debug: dump env and test claude ---
+LOG="/data/claude-debug.log"
+echo "=== $(date) ===" >> "$LOG"
+echo "ENV:" >> "$LOG"
+env | sort >> "$LOG"
+echo "---" >> "$LOG"
+echo "which claude: $(which claude 2>&1)" >> "$LOG"
+echo "claude version: $(claude --version 2>&1)" >> "$LOG"
+echo "CLAUDE_EXTRA_FLAGS: '$CLAUDE_EXTRA_FLAGS'" >> "$LOG"
+echo "---" >> "$LOG"
+# --- End debug ---
+
 SESSION="claude"
 
 # If tmux session exists, attach to it; otherwise create one running claude
