@@ -27,8 +27,8 @@ fi
 export HOME="/data"
 mkdir -p "${HOME}/.claude"
 
-# Ensure claude binary is on PATH (use shared location accessible to non-root user)
-export PATH="/usr/local/share/claude-bin:$PATH"
+# Ensure claude binary is on PATH
+export PATH="/root/.local/bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 
 # Expose Supervisor API token for HA API calls
@@ -66,11 +66,15 @@ chown -R claude:claude /data/.claude
 chmod -R 755 /config
 chown -R claude:claude /home/claude
 
-# Create a wrapper script that runs as the non-root 'claude' user via tmux
+# Prevent Claude Code from detecting a "nested" invocation
+unset CLAUDECODE
+unset CLAUDE_CODE_ENTRYPOINT
+
+# Create a wrapper script that attaches to or creates a tmux session
 cat > /tmp/claude-tmux.sh << 'WRAPPER'
 #!/bin/bash
 export HOME="/data"
-export PATH="/usr/local/share/claude-bin:$PATH"
+export PATH="/root/.local/bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 export TERM=xterm-256color
 
@@ -82,28 +86,16 @@ cd /config
 
 SESSION="claude"
 
-# --- Debug: test claude as non-root user ---
-echo "=== CLAUDE-DEBUG $(date) ===" >&2
-echo "whoami: $(whoami)" >&2
-echo "Contents of /usr/local/share/claude-bin:" >&2
-ls -la /usr/local/share/claude-bin/ >&2 || echo "DIR NOT FOUND" >&2
-echo "Contents of /root/.local/bin:" >&2
-ls -la /root/.local/bin/ >&2 || echo "DIR NOT FOUND" >&2
-echo "File type of claude:" >&2
-file /root/.local/bin/claude >&2 || true
-echo "---" >&2
-echo "Testing claude as claude user..." >&2
-su -s /bin/bash -c 'export HOME=/data && export PATH=/usr/local/share/claude-bin:$PATH && echo "running as: $(whoami)" && echo "PATH: $PATH" && which claude 2>&1 && claude --version 2>&1 && claude --dangerously-skip-permissions -p "say hello" 2>&1' claude 2>&1 | tee /dev/stderr || true
-echo "--- EXIT CODE: $? ---" >&2
-echo "Debug complete. Press enter to continue..."
-read
-# --- End debug ---
+# If tmux session exists, attach to it; otherwise create one running claude
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach-session -t "$SESSION"
+else
+    # Run claude as non-root user (--dangerously-skip-permissions is blocked as root)
+    # shellcheck disable=SC2086
+    exec tmux new-session -s "$SESSION" "su -s /bin/bash -c 'export HOME=/data && export PATH=/root/.local/bin:\$PATH && export USE_BUILTIN_RIPGREP=0 && export TERM=xterm-256color && unset CLAUDECODE && unset CLAUDE_CODE_ENTRYPOINT && cd /config && claude $CLAUDE_EXTRA_FLAGS' claude"
+fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
-
-# Belt-and-suspenders: unset nesting-detection vars
-unset CLAUDECODE
-unset CLAUDE_CODE_ENTRYPOINT
 
 # Launch ttyd with the tmux wrapper
 exec ttyd \

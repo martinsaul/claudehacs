@@ -26,9 +26,8 @@ ENV HOME=/root
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:$PATH"
 
-# Make claude binary accessible to the non-root user
-RUN cp -r /root/.local/bin /usr/local/share/claude-bin \
-    && chmod -R a+rx /usr/local/share/claude-bin
+# Make claude installation accessible to the non-root user
+RUN chmod -R a+rX /root /root/.local/share/claude
 
 # Copy entrypoint
 COPY run.sh /run.sh
