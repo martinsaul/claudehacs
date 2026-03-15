@@ -86,6 +86,12 @@ cd /config
 
 SESSION="claude"
 
+# --- Debug ---
+echo "=== CLAUDE-DEBUG $(date) ===" >&2
+su -s /bin/bash -c 'ls -la /root/.local/bin/claude && ls -la /root/.local/share/claude/versions/ && ls -la /root/.local/share/claude/versions/2.1.76 && /root/.local/share/claude/versions/2.1.76 --version' claude 2>&1 | tee /dev/stderr || true
+echo "--- END DEBUG ---" >&2
+# --- End Debug ---
+
 # If tmux session exists, attach to it; otherwise create one running claude
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
