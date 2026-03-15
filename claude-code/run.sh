@@ -58,6 +58,10 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
 fi
 
+# Kill stale tmux sessions to ensure a clean process tree
+# (prevents inherited CLAUDECODE env vars from surviving addon restarts)
+tmux kill-server 2>/dev/null || true
+
 # Create a wrapper script that attaches to or creates a tmux session
 cat > /tmp/claude-tmux.sh << 'WRAPPER'
 #!/bin/bash
@@ -65,6 +69,11 @@ export HOME="/data"
 export PATH="/root/.local/bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 export TERM=xterm-256color
+
+# Prevent Claude Code from detecting a "nested" invocation
+unset CLAUDECODE
+unset CLAUDE_CODE_ENTRYPOINT
+
 cd /config
 
 SESSION="claude"
@@ -78,6 +87,10 @@ else
 fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
+
+# Belt-and-suspenders: also unset nesting-detection vars in the parent process
+unset CLAUDECODE
+unset CLAUDE_CODE_ENTRYPOINT
 
 # Launch ttyd with the tmux wrapper
 exec ttyd \
