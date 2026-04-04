@@ -4,6 +4,12 @@ configuration:
     description: >-
       Your Anthropic API key. Leave blank to use OAuth authentication
       (recommended).
+  system_prompt:
+    name: System Prompt
+    description: >-
+      Custom system prompt appended to every new Claude session. Use this to
+      give Claude persistent context about your setup, preferred behavior, or
+      constraints. Leave blank for default behavior.
   dangerously_skip_permissions:
     name: Dangerously Skip Permissions
     description: >-

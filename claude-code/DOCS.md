@@ -13,6 +13,7 @@ Run Claude Code CLI directly from your Home Assistant sidebar.
 
 3. Configure the add-on (optional):
    - **Anthropic API Key**: If you have an API key, enter it in the addon configuration. Otherwise, Claude will prompt you to authenticate via OAuth on first launch.
+   - **System Prompt**: Set a custom system prompt that is appended to every new Claude session. Useful for giving Claude persistent context about your HA setup or preferred behavior.
 
 4. Start the add-on and click **Open Web UI** or find **Claude** in your sidebar.
 

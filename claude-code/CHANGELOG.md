@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0
+
+- Add configurable system prompt option (appended to every new Claude session)
+- Refactor launcher into separate script for cleaner argument handling
+
 ## 1.0.0
 
 - Initial release

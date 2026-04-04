@@ -9,9 +9,11 @@ set -e
 # Read addon options
 OPTIONS_FILE="/data/options.json"
 API_KEY=""
+SYSTEM_PROMPT=""
 SKIP_PERMISSIONS=false
 if [ -f "${OPTIONS_FILE}" ]; then
     API_KEY=$(jq -r '.anthropic_api_key // empty' "${OPTIONS_FILE}")
+    SYSTEM_PROMPT=$(jq -r '.system_prompt // empty' "${OPTIONS_FILE}")
     SKIP_PERMISSIONS=$(jq -r '.dangerously_skip_permissions // false' "${OPTIONS_FILE}")
 fi
 
@@ -43,10 +45,16 @@ INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
 
 echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
 
-# Build claude command
-CLAUDE_CMD="claude"
+# Write system prompt to file if configured (avoids shell quoting issues)
+SYSTEM_PROMPT_FILE="/tmp/claude-system-prompt.txt"
+if [ -n "${SYSTEM_PROMPT}" ]; then
+    printf '%s' "${SYSTEM_PROMPT}" > "${SYSTEM_PROMPT_FILE}"
+    echo "System prompt configured from addon options."
+else
+    rm -f "${SYSTEM_PROMPT_FILE}"
+fi
+
 if [ "${SKIP_PERMISSIONS}" = "true" ]; then
-    CLAUDE_CMD="claude --dangerously-skip-permissions"
     # Pre-accept the dangerous mode prompt so claude doesn't exit waiting for input
     SETTINGS_FILE="${HOME}/.claude/settings.json"
     if [ -f "${SETTINGS_FILE}" ]; then
@@ -63,8 +71,10 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     chown -R claude:claude /home/claude
 
     export CLAUDE_USE_GOSU=1
+    export CLAUDE_SKIP_PERMS=1
 else
     export CLAUDE_USE_GOSU=0
+    export CLAUDE_SKIP_PERMS=0
 fi
 
 # Kill stale tmux sessions to ensure a clean process tree
@@ -74,34 +84,42 @@ tmux kill-server 2>/dev/null || true
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
 
-# Export the claude command for use in the wrapper
-export CLAUDE_CMD
-
-# Create a wrapper script that attaches to or creates a tmux session
-cat > /tmp/claude-tmux.sh << 'WRAPPER'
+# Create a launcher script that execs claude with the right args
+cat > /tmp/claude-launcher.sh << 'LAUNCHER'
 #!/bin/bash
 export HOME="/data"
 export PATH="/root/.local/bin:$PATH"
 export USE_BUILTIN_RIPGREP=0
 export TERM=xterm-256color
-
-# Prevent Claude Code from detecting a "nested" invocation
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
-
 cd /config
 
-SESSION="claude"
+ARGS=()
+if [ "$CLAUDE_SKIP_PERMS" = "1" ]; then
+    ARGS+=(--dangerously-skip-permissions)
+fi
+PROMPT_FILE="/tmp/claude-system-prompt.txt"
+if [ -f "$PROMPT_FILE" ]; then
+    ARGS+=(--append-system-prompt "$(cat "$PROMPT_FILE")")
+fi
 
+if [ "$CLAUDE_USE_GOSU" = "1" ]; then
+    exec gosu claude claude "${ARGS[@]}"
+else
+    exec claude "${ARGS[@]}"
+fi
+LAUNCHER
+chmod +x /tmp/claude-launcher.sh
+
+# Create a wrapper script that attaches to or creates a tmux session
+cat > /tmp/claude-tmux.sh << 'WRAPPER'
+#!/bin/bash
+SESSION="claude"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 else
-    if [ "$CLAUDE_USE_GOSU" = "1" ]; then
-        # Drop privileges for --dangerously-skip-permissions
-        exec tmux new-session -s "$SESSION" "gosu claude $CLAUDE_CMD"
-    else
-        exec tmux new-session -s "$SESSION" "$CLAUDE_CMD"
-    fi
+    exec tmux new-session -s "$SESSION" /tmp/claude-launcher.sh
 fi
 WRAPPER
 chmod +x /tmp/claude-tmux.sh
