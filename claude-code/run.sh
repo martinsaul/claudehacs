@@ -86,6 +86,7 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     # Symlink .claude.json into /home/claude so Claude Code finds it
     # regardless of whether it resolves home from HOME env or passwd
     ln -sf /data/.claude.json /home/claude/.claude.json 2>/dev/null || true
+    chown claude:claude /data/.claude.json
     chown -R claude:claude /home/claude
 
     export CLAUDE_USE_GOSU=1
