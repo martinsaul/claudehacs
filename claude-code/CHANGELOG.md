@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1
+
+- Fix gosu resetting HOME, causing .claude and .ssh data to be lost on reboot
+- Symlink /home/claude/.claude and .ssh to persistent /data/ storage
+
 ## 1.4.0
 
 - Add configurable system prompt option (appended to every new Claude session)
