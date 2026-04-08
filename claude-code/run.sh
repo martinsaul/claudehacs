@@ -66,8 +66,17 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
 
     # --dangerously-skip-permissions is blocked as root; drop to non-root user via gosu
-    # Grant claude user access to necessary directories
-    chown -R claude:claude /data/.claude
+    # Persist .claude and .ssh across reboots via symlinks to /data
+    # gosu resets HOME to /home/claude, so we symlink back to /data
+    for dir in .claude .ssh; do
+        mkdir -p "/data/${dir}"
+        if [ -d "/home/claude/${dir}" ] && [ ! -L "/home/claude/${dir}" ]; then
+            cp -a "/home/claude/${dir}/." "/data/${dir}/" 2>/dev/null || true
+            rm -rf "/home/claude/${dir}"
+        fi
+        ln -sfn "/data/${dir}" "/home/claude/${dir}"
+        chown -R claude:claude "/data/${dir}"
+    done
     chown -R claude:claude /home/claude
 
     export CLAUDE_USE_GOSU=1
