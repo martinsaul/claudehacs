@@ -28,6 +28,10 @@ fi
 # Set HOME for Claude CLI config persistence
 export HOME="/data"
 mkdir -p "${HOME}/.claude"
+# Ensure .claude.json exists (Claude Code errors out if it's missing after an update)
+if [ ! -f "${HOME}/.claude.json" ]; then
+    echo '{}' > "${HOME}/.claude.json"
+fi
 
 # Ensure claude binary is on PATH
 export PATH="/root/.local/bin:$PATH"
@@ -66,6 +70,8 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
 
     # --dangerously-skip-permissions is blocked as root; drop to non-root user via gosu
+    # Point the claude user's home to /data so Claude Code finds its config there
+    usermod -d /data claude 2>/dev/null || true
     # Persist .claude and .ssh across reboots via symlinks to /data
     # gosu resets HOME to /home/claude, so we symlink back to /data
     for dir in .claude .ssh; do
@@ -77,6 +83,9 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
         ln -sfn "/data/${dir}" "/home/claude/${dir}"
         chown -R claude:claude "/data/${dir}"
     done
+    # Symlink .claude.json into /home/claude so Claude Code finds it
+    # regardless of whether it resolves home from HOME env or passwd
+    ln -sf /data/.claude.json /home/claude/.claude.json 2>/dev/null || true
     chown -R claude:claude /home/claude
 
     export CLAUDE_USE_GOSU=1
@@ -114,7 +123,7 @@ if [ -f "$PROMPT_FILE" ]; then
 fi
 
 if [ "$CLAUDE_USE_GOSU" = "1" ]; then
-    exec gosu claude claude "${ARGS[@]}"
+    exec gosu claude env HOME=/data claude "${ARGS[@]}"
 else
     exec claude "${ARGS[@]}"
 fi
