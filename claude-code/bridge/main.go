@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -324,7 +325,8 @@ func (b *Bridge) handleUserMessage(message string) {
 		b.broadcast(map[string]interface{}{"type": "bridge_error", "message": err.Error()})
 		return
 	}
-	cmd.Stderr = os.Stderr
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
 
 	b.mu.Lock()
 	b.proc = cmd
@@ -339,6 +341,7 @@ func (b *Bridge) handleUserMessage(message string) {
 	log.Printf("Spawned claude (PID %d) for session %s", cmd.Process.Pid, b.sessionID)
 
 	// Stream stdout line-by-line — each line is a JSON event
+	gotEvents := false
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer for large events
 	for scanner.Scan() {
@@ -352,6 +355,7 @@ func (b *Bridge) handleUserMessage(message string) {
 			log.Printf("Non-JSON line from claude: %s", line)
 			continue
 		}
+		gotEvents = true
 		// Wrap in a bridge envelope
 		b.broadcast(map[string]interface{}{
 			"type":  "claude_event",
@@ -360,7 +364,20 @@ func (b *Bridge) handleUserMessage(message string) {
 	}
 
 	if err := cmd.Wait(); err != nil {
-		log.Printf("claude exited: %v", err)
+		errMsg := strings.TrimSpace(stderrBuf.String())
+		log.Printf("claude exited: %v (stderr: %s)", err, errMsg)
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		b.broadcast(map[string]interface{}{"type": "bridge_error", "message": errMsg})
+	} else if !gotEvents {
+		errMsg := strings.TrimSpace(stderrBuf.String())
+		log.Printf("claude produced no output (stderr: %s)", errMsg)
+		if errMsg != "" {
+			b.broadcast(map[string]interface{}{"type": "bridge_error", "message": errMsg})
+		} else {
+			b.broadcast(map[string]interface{}{"type": "bridge_error", "message": "Claude exited without producing any output."})
+		}
 	} else {
 		log.Printf("claude completed successfully")
 	}

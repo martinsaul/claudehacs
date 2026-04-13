@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.1
+
+- **Fix silent failures**: Capture Claude subprocess stderr and forward errors to the chat UI instead of silently swallowing them
+- Show error message when Claude exits with non-zero status or produces no output
+
 ## 2.0.0
 
 - **Breaking: Replace ttyd terminal with chat UI**
