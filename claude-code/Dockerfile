@@ -1,4 +1,16 @@
 ARG BUILD_FROM
+ARG TARGETARCH
+
+# Stage 1: Build the Go bridge binary
+FROM golang:1.22-bookworm AS builder
+ARG TARGETARCH
+WORKDIR /src
+COPY bridge/go.mod bridge/go.sum ./
+RUN go mod download
+COPY bridge/*.go ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /claude-bridge .
+
+# Stage 2: Runtime
 FROM ${BUILD_FROM}
 
 # Install runtime dependencies
@@ -8,18 +20,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
     openssh-client \
-    tmux \
     ripgrep \
     ca-certificates \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Install ttyd
-RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd \
-    && chmod +x /usr/local/bin/ttyd
-
 # Create a non-root user for running Claude Code
-# (--dangerously-skip-permissions is blocked when running as root)
 RUN groupadd -r claude && useradd -r -g claude -m -d /home/claude -s /bin/bash claude
 
 # Install Claude CLI via native installer (as root, then make accessible)
@@ -29,6 +35,12 @@ ENV PATH="/root/.local/bin:$PATH"
 
 # Make claude installation accessible to the non-root user
 RUN chmod -R a+rX /root /root/.local/share/claude
+
+# Copy bridge binary from builder
+COPY --from=builder /claude-bridge /usr/local/bin/claude-bridge
+
+# Copy static assets
+COPY bridge/static/ /usr/local/share/claude-bridge/static/
 
 # Copy entrypoint
 COPY run.sh /run.sh

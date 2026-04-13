@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.0
+
+- **Breaking: Replace ttyd terminal with chat UI**
+  - New Claudio-style chat interface (textarea input + markdown-rendered output)
+  - Fixes Android IME input corruption (no more xterm.js)
+  - Fixes linebreak rendering issues through HA ingress
+  - Uses Claude Code's `--output-format stream-json` for structured event streaming
+  - Tool calls displayed as collapsible summaries
+  - Real-time streaming with visual cursor
+  - Interrupt button to stop Claude mid-response
+- **Auth keepalive**: Background process refreshes OAuth tokens before they expire
+  - Checks every 30 minutes, refreshes when token is within 2h of expiry
+  - Configurable via `auth_keepalive_hours` option (default 4, set to 0 to disable)
+  - Only active for OAuth authentication (not API key)
+- **New option**: `auth_keepalive_hours` — controls how aggressively to keep OAuth tokens alive
+- Remove ttyd and tmux dependencies
+- Add Go-based bridge binary (claude-bridge) for HTTP/WebSocket serving
+- Multi-turn conversations via `--resume` with persistent session ID
+
 ## 1.4.1
 
 - Fix gosu resetting HOME, causing .claude and .ssh data to be lost on reboot

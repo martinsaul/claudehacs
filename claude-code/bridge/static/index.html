@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Claude Code</title>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <span class="title">Claude Code</span>
+      <span id="status" class="status disconnected">disconnected</span>
+      <button id="interrupt-btn" class="btn-interrupt" disabled>Stop</button>
+    </header>
+    <main id="messages"></main>
+    <footer id="input-bar">
+      <textarea id="input" placeholder="Type a message..." rows="1" autofocus></textarea>
+      <button id="send-btn" class="btn-send">&#9654;</button>
+    </footer>
+  </div>
+  <script src="static/app.js"></script>
+</body>
+</html>

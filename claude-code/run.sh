@@ -2,8 +2,8 @@
 set -e
 
 # ==============================================================================
-# Claude Code Add-on: Entrypoint
-# Launches ttyd serving Claude CLI via tmux for session persistence
+# Claude Code Add-on v2.0: Entrypoint
+# Launches claude-bridge (chat UI + subprocess manager + auth keepalive)
 # ==============================================================================
 
 # Read addon options
@@ -11,10 +11,12 @@ OPTIONS_FILE="/data/options.json"
 API_KEY=""
 SYSTEM_PROMPT=""
 SKIP_PERMISSIONS=false
+AUTH_KEEPALIVE_HOURS=4
 if [ -f "${OPTIONS_FILE}" ]; then
     API_KEY=$(jq -r '.anthropic_api_key // empty' "${OPTIONS_FILE}")
     SYSTEM_PROMPT=$(jq -r '.system_prompt // empty' "${OPTIONS_FILE}")
     SKIP_PERMISSIONS=$(jq -r '.dangerously_skip_permissions // false' "${OPTIONS_FILE}")
+    AUTH_KEEPALIVE_HOURS=$(jq -r '.auth_keepalive_hours // 4' "${OPTIONS_FILE}")
 fi
 
 # Set API key if provided
@@ -44,22 +46,24 @@ export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
 cd /config || exit 1
 
 # Read ingress port and entry from supervisor
-INGRESS_PORT="${INGRESS_PORT:-7681}"
-INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
+export INGRESS_PORT="${INGRESS_PORT:-7681}"
+export INGRESS_ENTRY="${INGRESS_ENTRY:-/}"
 
-echo "Starting Claude Code on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
+echo "Starting Claude Code v2.0 on port ${INGRESS_PORT} with base path ${INGRESS_ENTRY}..."
 
-# Write system prompt to file if configured (avoids shell quoting issues)
-SYSTEM_PROMPT_FILE="/tmp/claude-system-prompt.txt"
+# Export bridge config via environment
+export CLAUDE_BIN="claude"
+export CLAUDE_WORKDIR="/config"
+export AUTH_KEEPALIVE_HOURS="${AUTH_KEEPALIVE_HOURS}"
+
+# System prompt
 if [ -n "${SYSTEM_PROMPT}" ]; then
-    printf '%s' "${SYSTEM_PROMPT}" > "${SYSTEM_PROMPT_FILE}"
+    export CLAUDE_SYSTEM_PROMPT="${SYSTEM_PROMPT}"
     echo "System prompt configured from addon options."
-else
-    rm -f "${SYSTEM_PROMPT_FILE}"
 fi
 
 if [ "${SKIP_PERMISSIONS}" = "true" ]; then
-    # Pre-accept the dangerous mode prompt so claude doesn't exit waiting for input
+    # Pre-accept the dangerous mode prompt
     SETTINGS_FILE="${HOME}/.claude/settings.json"
     if [ -f "${SETTINGS_FILE}" ]; then
         jq '.skipDangerousModePermissionPrompt = true' "${SETTINGS_FILE}" > "${SETTINGS_FILE}.tmp" \
@@ -69,11 +73,9 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
     fi
     echo "WARNING: Running Claude with --dangerously-skip-permissions. All permission prompts are disabled."
 
-    # --dangerously-skip-permissions is blocked as root; drop to non-root user via gosu
-    # Point the claude user's home to /data so Claude Code finds its config there
+    # Drop to non-root user via gosu (--dangerously-skip-permissions is blocked as root)
+    # Point claude user's home to /data; symlink .claude/.ssh back to /data for persistence
     usermod -d /data claude 2>/dev/null || true
-    # Persist .claude and .ssh across reboots via symlinks to /data
-    # gosu resets HOME to /home/claude, so we symlink back to /data
     for dir in .claude .ssh; do
         mkdir -p "/data/${dir}"
         if [ -d "/home/claude/${dir}" ] && [ ! -L "/home/claude/${dir}" ]; then
@@ -83,8 +85,7 @@ if [ "${SKIP_PERMISSIONS}" = "true" ]; then
         ln -sfn "/data/${dir}" "/home/claude/${dir}"
         chown -R claude:claude "/data/${dir}"
     done
-    # Symlink .claude.json into /home/claude so Claude Code finds it
-    # regardless of whether it resolves home from HOME env or passwd
+    # Symlink .claude.json so Claude Code finds it regardless of home resolution
     ln -sf /data/.claude.json /home/claude/.claude.json 2>/dev/null || true
     chown claude:claude /data/.claude.json
     chown -R claude:claude /home/claude
@@ -96,58 +97,9 @@ else
     export CLAUDE_SKIP_PERMS=0
 fi
 
-# Kill stale tmux sessions to ensure a clean process tree
-tmux kill-server 2>/dev/null || true
-
-# Prevent Claude Code from detecting a "nested" invocation
+# Prevent nested invocation detection
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
 
-# Create a launcher script that execs claude with the right args
-cat > /tmp/claude-launcher.sh << 'LAUNCHER'
-#!/bin/bash
-export HOME="/data"
-export PATH="/root/.local/bin:$PATH"
-export USE_BUILTIN_RIPGREP=0
-export TERM=xterm-256color
-unset CLAUDECODE
-unset CLAUDE_CODE_ENTRYPOINT
-cd /config
-
-ARGS=()
-if [ "$CLAUDE_SKIP_PERMS" = "1" ]; then
-    ARGS+=(--dangerously-skip-permissions)
-fi
-PROMPT_FILE="/tmp/claude-system-prompt.txt"
-if [ -f "$PROMPT_FILE" ]; then
-    ARGS+=(--append-system-prompt "$(cat "$PROMPT_FILE")")
-fi
-
-if [ "$CLAUDE_USE_GOSU" = "1" ]; then
-    exec gosu claude env HOME=/data claude "${ARGS[@]}"
-else
-    exec claude "${ARGS[@]}"
-fi
-LAUNCHER
-chmod +x /tmp/claude-launcher.sh
-
-# Create a wrapper script that attaches to or creates a tmux session
-cat > /tmp/claude-tmux.sh << 'WRAPPER'
-#!/bin/bash
-SESSION="claude"
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    exec tmux attach-session -t "$SESSION"
-else
-    exec tmux new-session -s "$SESSION" /tmp/claude-launcher.sh
-fi
-WRAPPER
-chmod +x /tmp/claude-tmux.sh
-
-# Launch ttyd with the tmux wrapper
-exec ttyd \
-    --writable \
-    --port "${INGRESS_PORT}" \
-    --base-path "${INGRESS_ENTRY}" \
-    --ping-interval 30 \
-    --max-clients 0 \
-    /tmp/claude-tmux.sh
+# Launch claude-bridge
+exec claude-bridge

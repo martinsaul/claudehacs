@@ -1,6 +1,6 @@
 name: Claude Code
-description: Claude CLI terminal accessible from the Home Assistant sidebar
-version: 1.4.3
+description: Claude Code chat interface accessible from the Home Assistant sidebar
+version: 2.0.0
 slug: claude-code
 url: https://github.com/martinsaul/claudehacs
 startup: application
@@ -8,7 +8,6 @@ boot: auto
 init: false
 ingress: true
 ingress_port: 7681
-ingress_stream: true
 panel_icon: mdi:robot
 panel_title: Claude
 homeassistant_api: true
@@ -28,9 +27,11 @@ options:
   anthropic_api_key: ""
   system_prompt: ""
   dangerously_skip_permissions: false
+  auth_keepalive_hours: 4
 schema:
   anthropic_api_key: str?
   system_prompt: str?
   dangerously_skip_permissions: bool
+  auth_keepalive_hours: "int(0,7)?"
 environment:
   PYTHONDONTWRITEBYTECODE: "1"

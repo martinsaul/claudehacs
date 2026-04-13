@@ -1,0 +1,496 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+// Config holds addon configuration read from environment.
+type Config struct {
+	Port            int
+	BasePath        string
+	ClaudeBin       string
+	WorkDir         string
+	HomeDir         string
+	SkipPerms       bool
+	UseGosu         bool
+	SystemPrompt    string
+	KeepaliveHours  int
+	APIKeySet       bool
+}
+
+// Bridge manages the Claude subprocess and WebSocket clients.
+type Bridge struct {
+	cfg       Config
+	sessionID string
+
+	mu        sync.Mutex
+	proc      *exec.Cmd
+	stdin     io.WriteCloser
+	working   bool
+	clients   map[*websocket.Conn]bool
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+func main() {
+	cfg := loadConfig()
+
+	b := &Bridge{
+		cfg:     cfg,
+		clients: make(map[*websocket.Conn]bool),
+	}
+
+	// Load or create session ID for conversation persistence
+	b.sessionID = b.loadOrCreateSessionID()
+
+	// Auth keepalive
+	if !cfg.APIKeySet && cfg.KeepaliveHours > 0 {
+		go b.authKeepalive()
+	}
+
+	// HTTP routes
+	mux := http.NewServeMux()
+	base := strings.TrimRight(cfg.BasePath, "/")
+
+	// Serve static files
+	staticDir := findStaticDir()
+	fs := http.FileServer(http.Dir(staticDir))
+	mux.HandleFunc(base+"/ws", b.handleWebSocket)
+	mux.HandleFunc(base+"/interrupt", b.handleInterrupt)
+	mux.HandleFunc(base+"/health", b.handleHealth)
+	mux.Handle(base+"/static/", http.StripPrefix(base+"/static/", fs))
+	mux.HandleFunc(base+"/", b.handleIndex(staticDir))
+
+	// Graceful shutdown
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Println("Shutting down...")
+		b.killProc()
+		os.Exit(0)
+	}()
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	log.Printf("claude-bridge listening on %s (base=%s)", addr, base)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func loadConfig() Config {
+	port, _ := strconv.Atoi(envOr("INGRESS_PORT", "7681"))
+	keepalive, _ := strconv.Atoi(envOr("AUTH_KEEPALIVE_HOURS", "4"))
+	return Config{
+		Port:           port,
+		BasePath:       envOr("INGRESS_ENTRY", "/"),
+		ClaudeBin:      envOr("CLAUDE_BIN", "claude"),
+		WorkDir:        envOr("CLAUDE_WORKDIR", "/config"),
+		HomeDir:        envOr("HOME", "/data"),
+		SkipPerms:      envOr("CLAUDE_SKIP_PERMS", "0") == "1",
+		UseGosu:        envOr("CLAUDE_USE_GOSU", "0") == "1",
+		SystemPrompt:   envOr("CLAUDE_SYSTEM_PROMPT", ""),
+		KeepaliveHours: keepalive,
+		APIKeySet:      envOr("ANTHROPIC_API_KEY", "") != "",
+	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func findStaticDir() string {
+	// Check next to binary first, then /usr/local/share/claude-bridge/static
+	exe, _ := os.Executable()
+	dir := filepath.Join(filepath.Dir(exe), "static")
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
+		return dir
+	}
+	return "/usr/local/share/claude-bridge/static"
+}
+
+func (b *Bridge) loadOrCreateSessionID() string {
+	path := filepath.Join(b.cfg.HomeDir, ".claude-bridge-session")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		id := strings.TrimSpace(string(data))
+		if id != "" {
+			log.Printf("Resuming session: %s", id)
+			return id
+		}
+	}
+	// Generate a new UUID-like ID
+	id := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		time.Now().UnixNano()&0xffffffff,
+		time.Now().UnixNano()>>32&0xffff,
+		0x4000|(time.Now().UnixNano()>>48&0x0fff),
+		0x8000|(time.Now().UnixNano()>>60&0x3fff),
+		time.Now().UnixNano()&0xffffffffffff)
+	os.WriteFile(path, []byte(id), 0644)
+	log.Printf("New session: %s", id)
+	return id
+}
+
+// handleIndex serves the chat UI.
+func (b *Bridge) handleIndex(staticDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		base := strings.TrimRight(b.cfg.BasePath, "/")
+		if r.URL.Path != base+"/" && r.URL.Path != base {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+	}
+}
+
+// handleHealth returns bridge status.
+func (b *Bridge) handleHealth(w http.ResponseWriter, r *http.Request) {
+	b.mu.Lock()
+	working := b.working
+	clients := len(b.clients)
+	b.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"working":%t,"clients":%d,"session":"%s"}`, working, clients, b.sessionID)
+}
+
+// handleInterrupt sends SIGINT to the running subprocess.
+func (b *Bridge) handleInterrupt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	b.mu.Lock()
+	proc := b.proc
+	b.mu.Unlock()
+	if proc != nil && proc.Process != nil {
+		proc.Process.Signal(syscall.SIGINT)
+		log.Println("Sent SIGINT to claude subprocess")
+		w.Write([]byte(`{"ok":true}`))
+	} else {
+		w.Write([]byte(`{"ok":false,"reason":"no process"}`))
+	}
+}
+
+// handleWebSocket upgrades to WS and relays messages.
+func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WS upgrade error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	b.mu.Lock()
+	b.clients[conn] = true
+	b.mu.Unlock()
+
+	defer func() {
+		b.mu.Lock()
+		delete(b.clients, conn)
+		b.mu.Unlock()
+	}()
+
+	log.Printf("WS client connected (%d total)", len(b.clients))
+
+	// Send current status
+	b.mu.Lock()
+	working := b.working
+	b.mu.Unlock()
+	conn.WriteJSON(map[string]interface{}{
+		"type":    "bridge_status",
+		"working": working,
+		"session": b.sessionID,
+	})
+
+	// Read messages from client
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("WS read error: %v", err)
+			return
+		}
+
+		var envelope struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(msg, &envelope); err != nil {
+			log.Printf("WS parse error: %v", err)
+			continue
+		}
+
+		switch envelope.Type {
+		case "user_message":
+			go b.handleUserMessage(envelope.Message)
+		case "interrupt":
+			b.mu.Lock()
+			proc := b.proc
+			b.mu.Unlock()
+			if proc != nil && proc.Process != nil {
+				proc.Process.Signal(syscall.SIGINT)
+			}
+		}
+	}
+}
+
+// handleUserMessage spawns claude --print --resume and streams output.
+func (b *Bridge) handleUserMessage(message string) {
+	b.mu.Lock()
+	if b.working {
+		b.mu.Unlock()
+		b.broadcast(map[string]interface{}{
+			"type":    "bridge_error",
+			"message": "Claude is still working. Use interrupt first.",
+		})
+		return
+	}
+	b.working = true
+	b.mu.Unlock()
+
+	// Notify clients
+	b.broadcast(map[string]interface{}{
+		"type":    "bridge_status",
+		"working": true,
+	})
+
+	defer func() {
+		b.mu.Lock()
+		b.working = false
+		b.proc = nil
+		b.stdin = nil
+		b.mu.Unlock()
+		b.broadcast(map[string]interface{}{
+			"type":    "bridge_status",
+			"working": false,
+		})
+	}()
+
+	// Echo user message to clients
+	b.broadcast(map[string]interface{}{
+		"type":    "user_message",
+		"message": message,
+	})
+
+	// Build command
+	args := []string{
+		"--print",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--resume", b.sessionID,
+	}
+	if b.cfg.SkipPerms {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	if b.cfg.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", b.cfg.SystemPrompt)
+	}
+	args = append(args, message)
+
+	var cmd *exec.Cmd
+	if b.cfg.UseGosu {
+		gosuArgs := append([]string{"claude", "env", "HOME=" + b.cfg.HomeDir, b.cfg.ClaudeBin}, args...)
+		cmd = exec.Command("gosu", gosuArgs...)
+	} else {
+		cmd = exec.Command(b.cfg.ClaudeBin, args...)
+	}
+	cmd.Dir = b.cfg.WorkDir
+	cmd.Env = append(os.Environ(),
+		"HOME="+b.cfg.HomeDir,
+		"TERM=dumb",
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("stdout pipe error: %v", err)
+		b.broadcast(map[string]interface{}{"type": "bridge_error", "message": err.Error()})
+		return
+	}
+	cmd.Stderr = os.Stderr
+
+	b.mu.Lock()
+	b.proc = cmd
+	b.mu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("claude start error: %v", err)
+		b.broadcast(map[string]interface{}{"type": "bridge_error", "message": err.Error()})
+		return
+	}
+
+	log.Printf("Spawned claude (PID %d) for session %s", cmd.Process.Pid, b.sessionID)
+
+	// Stream stdout line-by-line — each line is a JSON event
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer for large events
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		// Parse to validate JSON, then forward raw
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			log.Printf("Non-JSON line from claude: %s", line)
+			continue
+		}
+		// Wrap in a bridge envelope
+		b.broadcast(map[string]interface{}{
+			"type":  "claude_event",
+			"event": event,
+		})
+	}
+
+	if err := cmd.Wait(); err != nil {
+		log.Printf("claude exited: %v", err)
+	} else {
+		log.Printf("claude completed successfully")
+	}
+}
+
+// broadcast sends a message to all connected WebSocket clients.
+func (b *Bridge) broadcast(msg interface{}) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for conn := range b.clients {
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("WS write error: %v", err)
+			conn.Close()
+			delete(b.clients, conn)
+		}
+	}
+}
+
+func (b *Bridge) killProc() {
+	b.mu.Lock()
+	proc := b.proc
+	b.mu.Unlock()
+	if proc != nil && proc.Process != nil {
+		proc.Process.Signal(syscall.SIGTERM)
+		time.Sleep(500 * time.Millisecond)
+		proc.Process.Kill()
+	}
+}
+
+// authKeepalive periodically checks and refreshes OAuth tokens.
+func (b *Bridge) authKeepalive() {
+	interval := time.Duration(b.cfg.KeepaliveHours) * time.Hour
+	if interval <= 0 {
+		return
+	}
+	checkInterval := 30 * time.Minute
+	log.Printf("Auth keepalive active (check every %v, refresh when ≤2h remaining)", checkInterval)
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		b.checkAndRefreshAuth()
+	}
+}
+
+func (b *Bridge) checkAndRefreshAuth() {
+	credsPath := filepath.Join(b.cfg.HomeDir, ".claude", ".credentials.json")
+	data, err := os.ReadFile(credsPath)
+	if err != nil {
+		log.Printf("[auth-keepalive] Cannot read credentials: %v", err)
+		return
+	}
+
+	var creds struct {
+		ClaudeAiOauth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		log.Printf("[auth-keepalive] Cannot parse credentials: %v", err)
+		return
+	}
+
+	expiresAt := creds.ClaudeAiOauth.ExpiresAt
+	if expiresAt == 0 {
+		log.Printf("[auth-keepalive] No OAuth token found")
+		return
+	}
+
+	nowMs := time.Now().UnixMilli()
+	remainingMs := expiresAt - nowMs
+	remainingHr := remainingMs / 3_600_000
+
+	if remainingMs > 2*3_600_000 {
+		log.Printf("[auth-keepalive] Token valid for ~%dh, no action needed", remainingHr)
+		return
+	}
+
+	log.Printf("[auth-keepalive] Token expires in ~%dh, triggering refresh...", remainingHr)
+
+	// Try auth status first
+	var cmd *exec.Cmd
+	if b.cfg.UseGosu {
+		cmd = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir, b.cfg.ClaudeBin, "auth", "status", "--json")
+	} else {
+		cmd = exec.Command(b.cfg.ClaudeBin, "auth", "status", "--json")
+	}
+	cmd.Env = append(os.Environ(), "HOME="+b.cfg.HomeDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[auth-keepalive] auth status failed: %v: %s", err, string(output))
+	} else {
+		log.Printf("[auth-keepalive] auth status OK")
+	}
+
+	// Check if token was actually refreshed
+	data2, _ := os.ReadFile(credsPath)
+	var creds2 struct {
+		ClaudeAiOauth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	json.Unmarshal(data2, &creds2)
+
+	if creds2.ClaudeAiOauth.ExpiresAt > expiresAt {
+		log.Printf("[auth-keepalive] Token refreshed successfully (new expiry in ~%dh)",
+			(creds2.ClaudeAiOauth.ExpiresAt-nowMs)/3_600_000)
+		return
+	}
+
+	// Fallback: force an API call
+	log.Printf("[auth-keepalive] auth status didn't refresh, forcing API call...")
+	var cmd2 *exec.Cmd
+	if b.cfg.UseGosu {
+		cmd2 = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir, b.cfg.ClaudeBin,
+			"--print", "--output-format", "json", "--no-session-persistence", "ok")
+	} else {
+		cmd2 = exec.Command(b.cfg.ClaudeBin,
+			"--print", "--output-format", "json", "--no-session-persistence", "ok")
+	}
+	cmd2.Env = append(os.Environ(), "HOME="+b.cfg.HomeDir)
+	out2, err2 := cmd2.CombinedOutput()
+	if err2 != nil {
+		log.Printf("[auth-keepalive] API call fallback failed: %v: %s", err2, string(out2))
+	} else {
+		log.Printf("[auth-keepalive] API call succeeded, token should be refreshed")
+	}
+}

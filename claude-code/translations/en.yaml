@@ -2,19 +2,18 @@ configuration:
   anthropic_api_key:
     name: Anthropic API Key
     description: >-
-      Your Anthropic API key. Leave blank to use OAuth authentication
-      (recommended).
+      Your Anthropic API key. Leave blank to use OAuth authentication.
   system_prompt:
     name: System Prompt
     description: >-
-      Custom system prompt appended to every new Claude session. Use this to
-      give Claude persistent context about your setup, preferred behavior, or
-      constraints. Leave blank for default behavior.
+      Additional system prompt appended to every new Claude session.
   dangerously_skip_permissions:
-    name: Dangerously Skip Permissions
+    name: Skip Permission Prompts
     description: >-
-      WARNING: This disables ALL permission prompts, allowing Claude to execute
-      any command, modify any file, and make any system change without asking
-      for confirmation. You accept full responsibility for any consequences,
-      including data loss, broken configurations, or unintended changes to your
-      Home Assistant system. Use at your own risk.
+      Bypass all permission checks. Only enable in trusted environments.
+  auth_keepalive_hours:
+    name: Auth Keepalive Interval (hours)
+    description: >-
+      How often to check and refresh OAuth tokens in the background.
+      Set to 0 to disable. Only applies when using OAuth, not API keys.
+      Default: 4 hours.
