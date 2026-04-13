@@ -5,10 +5,8 @@ ARG TARGETARCH
 FROM golang:1.22-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /src
-COPY bridge/go.mod bridge/go.sum ./
-RUN go mod download
-COPY bridge/*.go ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /claude-bridge .
+COPY bridge/ ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -mod=vendor -ldflags="-s -w" -o /claude-bridge .
 
 # Stage 2: Runtime
 FROM ${BUILD_FROM}
