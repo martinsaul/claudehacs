@@ -1,6 +1,6 @@
 name: Claude Code
 description: Claude Code chat interface accessible from the Home Assistant sidebar
-version: 2.0.3
+version: 2.0.4
 slug: claude-code
 url: https://github.com/martinsaul/claudehacs
 startup: application

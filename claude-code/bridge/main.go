@@ -237,6 +237,14 @@ func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"session": b.sessionID,
 	})
 
+	// If not authenticated, tell this client immediately
+	if !b.cfg.APIKeySet && !b.isAuthenticated() {
+		conn.WriteJSON(map[string]interface{}{
+			"type":    "auth_required",
+			"message": "Not authenticated. Click Login to sign in with your Claude account.",
+		})
+	}
+
 	// Read messages from client
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -566,25 +574,17 @@ func (b *Bridge) checkAndRefreshAuth() {
 	}
 }
 
-// checkAuthOnStartup checks if we have valid credentials; if not, notifies clients.
+// checkAuthOnStartup logs auth status at boot.
 func (b *Bridge) checkAuthOnStartup() {
-	// Wait a moment for WebSocket clients to connect
-	time.Sleep(2 * time.Second)
-
 	if b.cfg.APIKeySet {
+		log.Printf("[auth] API key configured, skipping OAuth check")
 		return
 	}
-
 	if b.isAuthenticated() {
 		log.Printf("[auth] OAuth credentials found and valid")
-		return
+	} else {
+		log.Printf("[auth] No valid OAuth credentials found, clients will be prompted on connect")
 	}
-
-	log.Printf("[auth] No valid OAuth credentials found, notifying clients")
-	b.broadcast(map[string]interface{}{
-		"type":    "auth_required",
-		"message": "Not authenticated. Click Login to sign in with your Claude account.",
-	})
 }
 
 // isAuthenticated checks if valid OAuth credentials exist.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.4
+
+- **Fix auth prompt not appearing**: Auth status is now checked per-client on WebSocket connect instead of broadcasting once on startup (which raced against client connections and was lost)
+
 ## 2.0.3
 
 - **In-app OAuth login flow**: When no credentials are found, the chat UI shows a Login button. Clicking it spawns `claude auth login`, extracts the OAuth URL, and presents it as a clickable link. The user authenticates in their browser, copies the authorization code, and pastes it back into the chat UI to complete the flow. No terminal access or API key required.
