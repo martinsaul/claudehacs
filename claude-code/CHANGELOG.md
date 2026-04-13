@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2
+
+- **Fix "No conversation found with session ID" crash**: The bridge was generating a fake session ID and always passing `--resume`, but Claude Code rejects `--resume` with an ID it never created. Now the first message starts a fresh session (no `--resume`), captures the real session ID from Claude's `init` event, and uses that for subsequent `--resume` calls. If a saved session becomes stale (e.g. after addon rebuild), the bridge auto-retries without `--resume`.
+
 ## 2.0.1
 
 - **Fix silent failures**: Capture Claude subprocess stderr and forward errors to the chat UI instead of silently swallowing them

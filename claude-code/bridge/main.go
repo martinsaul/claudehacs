@@ -59,8 +59,8 @@ func main() {
 		clients: make(map[*websocket.Conn]bool),
 	}
 
-	// Load or create session ID for conversation persistence
-	b.sessionID = b.loadOrCreateSessionID()
+	// Load saved session ID (may be empty if first run)
+	b.sessionID = b.loadSessionID()
 
 	// Auth keepalive
 	if !cfg.APIKeySet && cfg.KeepaliveHours > 0 {
@@ -129,26 +129,32 @@ func findStaticDir() string {
 	return "/usr/local/share/claude-bridge/static"
 }
 
-func (b *Bridge) loadOrCreateSessionID() string {
+func (b *Bridge) loadSessionID() string {
 	path := filepath.Join(b.cfg.HomeDir, ".claude-bridge-session")
 	data, err := os.ReadFile(path)
 	if err == nil {
 		id := strings.TrimSpace(string(data))
 		if id != "" {
-			log.Printf("Resuming session: %s", id)
+			log.Printf("Found saved session: %s", id)
 			return id
 		}
 	}
-	// Generate a new UUID-like ID
-	id := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		time.Now().UnixNano()&0xffffffff,
-		time.Now().UnixNano()>>32&0xffff,
-		0x4000|(time.Now().UnixNano()>>48&0x0fff),
-		0x8000|(time.Now().UnixNano()>>60&0x3fff),
-		time.Now().UnixNano()&0xffffffffffff)
-	os.WriteFile(path, []byte(id), 0644)
-	log.Printf("New session: %s", id)
-	return id
+	log.Printf("No saved session found, will start fresh")
+	return ""
+}
+
+func (b *Bridge) saveSessionID(id string) {
+	path := filepath.Join(b.cfg.HomeDir, ".claude-bridge-session")
+	if err := os.WriteFile(path, []byte(id), 0644); err != nil {
+		log.Printf("Failed to save session ID: %v", err)
+	} else {
+		log.Printf("Saved session ID: %s", id)
+	}
+}
+
+func (b *Bridge) clearSessionID() {
+	path := filepath.Join(b.cfg.HomeDir, ".claude-bridge-session")
+	os.Remove(path)
 }
 
 // handleIndex serves the chat UI.
@@ -296,7 +302,12 @@ func (b *Bridge) handleUserMessage(message string) {
 		"--print",
 		"--output-format", "stream-json",
 		"--verbose",
-		"--resume", b.sessionID,
+	}
+	b.mu.Lock()
+	resumeID := b.sessionID
+	b.mu.Unlock()
+	if resumeID != "" {
+		args = append(args, "--resume", resumeID)
 	}
 	if b.cfg.SkipPerms {
 		args = append(args, "--dangerously-skip-permissions")
@@ -356,6 +367,17 @@ func (b *Bridge) handleUserMessage(message string) {
 			continue
 		}
 		gotEvents = true
+
+		// Capture the real session ID from the init event
+		if eventType, _ := event["type"].(string); eventType == "system" {
+			if sid, ok := event["session_id"].(string); ok && sid != "" {
+				b.mu.Lock()
+				b.sessionID = sid
+				b.mu.Unlock()
+				b.saveSessionID(sid)
+			}
+		}
+
 		// Wrap in a bridge envelope
 		b.broadcast(map[string]interface{}{
 			"type":  "claude_event",
@@ -363,15 +385,34 @@ func (b *Bridge) handleUserMessage(message string) {
 		})
 	}
 
-	if err := cmd.Wait(); err != nil {
-		errMsg := strings.TrimSpace(stderrBuf.String())
-		log.Printf("claude exited: %v (stderr: %s)", err, errMsg)
+	waitErr := cmd.Wait()
+	errMsg := strings.TrimSpace(stderrBuf.String())
+
+	if waitErr != nil {
+		log.Printf("claude exited: %v (stderr: %s)", waitErr, errMsg)
+
+		// If --resume failed because the session doesn't exist, clear it and retry
+		if resumeID != "" && strings.Contains(errMsg, "No conversation found with session ID") {
+			log.Printf("Session %s not found, clearing and retrying without --resume", resumeID)
+			b.mu.Lock()
+			b.sessionID = ""
+			b.mu.Unlock()
+			b.clearSessionID()
+			// Retry this message without --resume (recursive, but resumeID will be "" so no infinite loop)
+			b.mu.Lock()
+			b.working = false
+			b.proc = nil
+			b.stdin = nil
+			b.mu.Unlock()
+			b.handleUserMessage(message)
+			return
+		}
+
 		if errMsg == "" {
-			errMsg = err.Error()
+			errMsg = waitErr.Error()
 		}
 		b.broadcast(map[string]interface{}{"type": "bridge_error", "message": errMsg})
 	} else if !gotEvents {
-		errMsg := strings.TrimSpace(stderrBuf.String())
 		log.Printf("claude produced no output (stderr: %s)", errMsg)
 		if errMsg != "" {
 			b.broadcast(map[string]interface{}{"type": "bridge_error", "message": errMsg})
