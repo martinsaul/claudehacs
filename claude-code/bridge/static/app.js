@@ -255,30 +255,26 @@
       return '<pre><code>' + escapeHtml(code.trimEnd()) + '</code></pre>';
     });
     // Inline code
-    text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+    text = text.replace(/`([^`]+)`/g, function(_, code) {
+      return '<code>' + escapeHtml(code) + '</code>';
+    });
     // Bold
     text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     // Italic
     text = text.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
     // Links
     text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-    // Line breaks (but not inside pre blocks)
-    const parts = text.split(/<\/?pre[^>]*>/);
-    for (let i = 0; i < parts.length; i += 2) {
-      if (parts[i]) parts[i] = parts[i].replace(/\n/g, '<br>');
+    // Line breaks outside of pre blocks
+    var tokens = text.split(/(<\/?pre[^>]*>)/);
+    var inPre = false;
+    var result = '';
+    for (var i = 0; i < tokens.length; i++) {
+      if (/<pre[^>]*>/.test(tokens[i])) { inPre = true; result += tokens[i]; }
+      else if (/<\/pre>/.test(tokens[i])) { inPre = false; result += tokens[i]; }
+      else if (!inPre) { result += tokens[i].replace(/\n/g, '<br>'); }
+      else { result += tokens[i]; }
     }
-    text = parts.join(function() {
-      // Rejoin with the pre tags
-      const tags = text.match(/<\/?pre[^>]*>/g) || [];
-      let result = parts[0] || '';
-      for (let i = 0; i < tags.length; i++) {
-        result += tags[i] + (parts[i + 1] || '');
-      }
-      return result;
-    }());
-    // Actually, simpler approach for line breaks:
-    // Just replace \n with <br> outside of pre blocks
-    return text;
+    return result;
   }
 
   // --- Input handling ---
