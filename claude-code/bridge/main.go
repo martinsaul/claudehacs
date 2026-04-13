@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -836,8 +837,16 @@ func (b *Bridge) handleAuthCode(code string) {
 		"message": "Submitting code...",
 	})
 
+	// The code may contain # (fragment separator) — must be URL-encoded.
+	// Also strip any trailing #state the user may have pasted from the
+	// platform callback page (the state is already known).
+	if idx := strings.Index(code, "#"); idx >= 0 {
+		code = code[:idx]
+	}
+
 	// Hit the CLI's local callback endpoint
-	callbackURL := fmt.Sprintf("http://localhost:%d/callback?code=%s&state=%s", port, code, state)
+	callbackURL := fmt.Sprintf("http://localhost:%d/callback?code=%s&state=%s",
+		port, url.QueryEscape(code), url.QueryEscape(state))
 	resp, err := http.Get(callbackURL)
 	if err != nil {
 		log.Printf("[auth] Callback request failed: %v", err)
