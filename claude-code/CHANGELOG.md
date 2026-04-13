@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.5
+
+- **Fix auth code submission**: `claude auth login` does not read the authorization code from stdin -- it starts a local HTTP server and expects the code at `/callback?code=X&state=Y`. The bridge now finds the CLI's listening port via `/proc/net/tcp6` and submits the code by hitting the local callback endpoint.
+
 ## 2.0.4
 
 - **Fix auth prompt not appearing**: Auth status is now checked per-client on WebSocket connect instead of broadcasting once on startup (which raced against client connections and was lost)
