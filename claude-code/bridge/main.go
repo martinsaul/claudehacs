@@ -45,6 +45,12 @@ type Bridge struct {
 	stdin     io.WriteCloser
 	working   bool
 	clients   map[*websocket.Conn]bool
+
+	// Auth flow state
+	authMu      sync.Mutex
+	authProc    *exec.Cmd
+	authStdin   io.WriteCloser
+	authPending bool // true while waiting for user to paste code
 }
 
 var upgrader = websocket.Upgrader{
@@ -66,6 +72,9 @@ func main() {
 	if !cfg.APIKeySet && cfg.KeepaliveHours > 0 {
 		go b.authKeepalive()
 	}
+
+	// Check auth status on startup
+	go b.checkAuthOnStartup()
 
 	// HTTP routes
 	mux := http.NewServeMux()
@@ -255,6 +264,10 @@ func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if proc != nil && proc.Process != nil {
 				proc.Process.Signal(syscall.SIGINT)
 			}
+		case "auth_start":
+			go b.handleAuthStart()
+		case "auth_code":
+			go b.handleAuthCode(envelope.Message)
 		}
 	}
 }
@@ -551,4 +564,277 @@ func (b *Bridge) checkAndRefreshAuth() {
 	} else {
 		log.Printf("[auth-keepalive] API call succeeded, token should be refreshed")
 	}
+}
+
+// checkAuthOnStartup checks if we have valid credentials; if not, notifies clients.
+func (b *Bridge) checkAuthOnStartup() {
+	// Wait a moment for WebSocket clients to connect
+	time.Sleep(2 * time.Second)
+
+	if b.cfg.APIKeySet {
+		return
+	}
+
+	if b.isAuthenticated() {
+		log.Printf("[auth] OAuth credentials found and valid")
+		return
+	}
+
+	log.Printf("[auth] No valid OAuth credentials found, notifying clients")
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_required",
+		"message": "Not authenticated. Click Login to sign in with your Claude account.",
+	})
+}
+
+// isAuthenticated checks if valid OAuth credentials exist.
+func (b *Bridge) isAuthenticated() bool {
+	credsPath := filepath.Join(b.cfg.HomeDir, ".claude", ".credentials.json")
+	data, err := os.ReadFile(credsPath)
+	if err != nil {
+		return false
+	}
+	var creds struct {
+		ClaudeAiOauth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return false
+	}
+	// Check if token exists and hasn't expired
+	return creds.ClaudeAiOauth.ExpiresAt > time.Now().UnixMilli()
+}
+
+// handleAuthStart launches `claude auth login` and captures the OAuth URL.
+func (b *Bridge) handleAuthStart() {
+	b.authMu.Lock()
+	if b.authPending {
+		b.authMu.Unlock()
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "pending",
+			"message": "Auth flow already in progress. Paste the code from the browser.",
+		})
+		return
+	}
+	b.authPending = true
+	b.authMu.Unlock()
+
+	defer func() {
+		b.authMu.Lock()
+		b.authPending = false
+		b.authProc = nil
+		b.authStdin = nil
+		b.authMu.Unlock()
+	}()
+
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_status",
+		"status":  "starting",
+		"message": "Starting OAuth login...",
+	})
+
+	// Build the auth login command
+	var cmd *exec.Cmd
+	if b.cfg.UseGosu {
+		cmd = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir,
+			b.cfg.ClaudeBin, "auth", "login", "--claudeai")
+	} else {
+		cmd = exec.Command(b.cfg.ClaudeBin, "auth", "login", "--claudeai")
+	}
+	cmd.Env = append(os.Environ(),
+		"HOME="+b.cfg.HomeDir,
+		"BROWSER=/usr/bin/false", // Prevent browser open attempts
+	)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("[auth] stdin pipe error: %v", err)
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Failed to start auth: " + err.Error(),
+		})
+		return
+	}
+
+	// Capture stdout+stderr via pipes and a channel so we can poll safely
+	stdoutPipe, err2 := cmd.StdoutPipe()
+	if err2 != nil {
+		log.Printf("[auth] stdout pipe error: %v", err2)
+		b.broadcast(map[string]interface{}{"type": "auth_status", "status": "error", "message": err2.Error()})
+		return
+	}
+	stderrPipe, err3 := cmd.StderrPipe()
+	if err3 != nil {
+		log.Printf("[auth] stderr pipe error: %v", err3)
+		b.broadcast(map[string]interface{}{"type": "auth_status", "status": "error", "message": err3.Error()})
+		return
+	}
+
+	b.authMu.Lock()
+	b.authProc = cmd
+	b.authStdin = stdin
+	b.authMu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[auth] start error: %v", err)
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Failed to start auth: " + err.Error(),
+		})
+		return
+	}
+
+	log.Printf("[auth] Spawned claude auth login (PID %d)", cmd.Process.Pid)
+
+	// Read all output in background, push lines to a channel
+	outputCh := make(chan string, 50)
+	var outputCollector bytes.Buffer
+	var outputMu sync.Mutex
+	readPipe := func(r io.Reader) {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := scanner.Text()
+			outputMu.Lock()
+			outputCollector.WriteString(line + "\n")
+			outputMu.Unlock()
+			outputCh <- line
+		}
+	}
+	go readPipe(stdoutPipe)
+	go readPipe(stderrPipe)
+
+	// Wait for the URL to appear
+	authURL := ""
+	deadline := time.After(15 * time.Second)
+	for authURL == "" {
+		select {
+		case <-deadline:
+			outputMu.Lock()
+			collected := outputCollector.String()
+			outputMu.Unlock()
+			log.Printf("[auth] Timed out waiting for URL. Output so far: %s", collected)
+			b.broadcast(map[string]interface{}{
+				"type":    "auth_status",
+				"status":  "error",
+				"message": "Timed out waiting for auth URL. Output: " + collected,
+			})
+			cmd.Process.Kill()
+			cmd.Wait()
+			return
+		case line := <-outputCh:
+			if url := extractAuthURL(line); url != "" {
+				authURL = url
+			}
+		}
+	}
+
+	log.Printf("[auth] Got auth URL: %s", authURL)
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_url",
+		"url":     authURL,
+		"message": "Open this URL in your browser, sign in, then paste the code below.",
+	})
+
+	// Now wait for the process to exit (handleAuthCode will write to stdin)
+	waitErr := cmd.Wait()
+	outputMu.Lock()
+	output := outputCollector.String()
+	outputMu.Unlock()
+
+	if waitErr != nil {
+		log.Printf("[auth] claude auth login exited with error: %v (output: %s)", waitErr, output)
+		// Check if it succeeded despite error exit
+		if b.isAuthenticated() {
+			log.Printf("[auth] Despite error exit, credentials are valid")
+			b.broadcast(map[string]interface{}{
+				"type":    "auth_status",
+				"status":  "success",
+				"message": "Authentication successful!",
+			})
+			return
+		}
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Auth failed: " + strings.TrimSpace(output),
+		})
+		return
+	}
+
+	log.Printf("[auth] claude auth login completed successfully")
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_status",
+		"status":  "success",
+		"message": "Authentication successful!",
+	})
+}
+
+// handleAuthCode writes the authorization code to the waiting auth process stdin.
+func (b *Bridge) handleAuthCode(code string) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Empty code. Please paste the code from the browser.",
+		})
+		return
+	}
+
+	b.authMu.Lock()
+	stdin := b.authStdin
+	pending := b.authPending
+	b.authMu.Unlock()
+
+	if !pending || stdin == nil {
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "No auth flow in progress. Click Login to start.",
+		})
+		return
+	}
+
+	log.Printf("[auth] Writing auth code to subprocess stdin")
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_status",
+		"status":  "completing",
+		"message": "Submitting code...",
+	})
+
+	// Write the code followed by newline
+	_, err := io.WriteString(stdin, code+"\n")
+	if err != nil {
+		log.Printf("[auth] Failed to write code to stdin: %v", err)
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Failed to submit code: " + err.Error(),
+		})
+	}
+	// Close stdin so the process can proceed
+	stdin.Close()
+}
+
+// extractAuthURL finds the OAuth URL in claude auth login output.
+func extractAuthURL(output string) string {
+	// Look for the URL that starts with https://claude.com/
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "https://claude.com/") || strings.HasPrefix(line, "https://console.anthropic.com/") {
+			return line
+		}
+		// Also check if the URL is embedded in a "visit: URL" pattern
+		if idx := strings.Index(line, "https://claude.com/"); idx >= 0 {
+			return strings.TrimSpace(line[idx:])
+		}
+		if idx := strings.Index(line, "https://console.anthropic.com/"); idx >= 0 {
+			return strings.TrimSpace(line[idx:])
+		}
+	}
+	return ""
 }

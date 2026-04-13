@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.3
+
+- **In-app OAuth login flow**: When no credentials are found, the chat UI shows a Login button. Clicking it spawns `claude auth login`, extracts the OAuth URL, and presents it as a clickable link. The user authenticates in their browser, copies the authorization code, and pastes it back into the chat UI to complete the flow. No terminal access or API key required.
+- Login button also available in the header bar for re-authentication
+
 ## 2.0.2
 
 - **Fix "No conversation found with session ID" crash**: The bridge was generating a fake session ID and always passing `--resume`, but Claude Code rejects `--resume` with an ID it never created. Now the first message starts a fresh session (no `--resume`), captures the real session ID from Claude's `init` event, and uses that for subsequent `--resume` calls. If a saved session becomes stale (e.g. after addon rebuild), the bridge auto-retries without `--resume`.

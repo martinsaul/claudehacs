@@ -35,6 +35,11 @@ header {
 .status.connected { background: var(--green); color: #000; }
 .status.disconnected { background: var(--red); color: #000; }
 .status.working { background: var(--orange); color: #000; }
+.btn-login {
+  padding: 4px 12px; border: 1px solid var(--accent); border-radius: 4px;
+  background: transparent; color: var(--accent); cursor: pointer; font-size: 12px;
+}
+.btn-login:hover { background: var(--accent); color: #000; }
 .btn-interrupt {
   padding: 4px 12px; border: 1px solid var(--red); border-radius: 4px;
   background: transparent; color: var(--red); cursor: pointer; font-size: 12px;
@@ -105,6 +110,29 @@ footer {
 /* Streaming cursor */
 .streaming::after { content: '▊'; animation: blink 1s step-end infinite; color: var(--accent); }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* Auth UI */
+.msg-auth {
+  align-self: center; background: var(--bg-light); border: 1px solid var(--accent-dim);
+  border-radius: 10px; padding: 20px; max-width: 480px; width: 90%; text-align: center;
+}
+.auth-message { margin-bottom: 14px; color: var(--text); font-size: 14px; line-height: 1.5; }
+.auth-url { margin-bottom: 14px; }
+.auth-url a { color: var(--accent); text-decoration: underline; font-size: 14px; word-break: break-all; }
+.btn-auth {
+  padding: 8px 20px; border: none; border-radius: 6px;
+  background: var(--accent); color: #fff; font-size: 14px; cursor: pointer;
+  font-family: var(--font);
+}
+.btn-auth:hover { background: var(--accent-dim); }
+.auth-code-input {
+  display: flex; gap: 8px; margin-top: 12px; align-items: center;
+}
+.auth-code-input input {
+  flex: 1; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-lighter); color: var(--text); font-family: var(--mono); font-size: 13px;
+}
+.auth-code-input input:focus { outline: none; border-color: var(--accent); }
 
 /* Scrollbar */
 main::-webkit-scrollbar { width: 6px; }

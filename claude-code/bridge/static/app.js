@@ -6,9 +6,11 @@
   const sendBtn = document.getElementById('send-btn');
   const statusEl = document.getElementById('status');
   const interruptBtn = document.getElementById('interrupt-btn');
+  const loginBtn = document.getElementById('login-btn');
 
   let ws = null;
   let working = false;
+  let authPending = false;
   let currentAssistantEl = null;
   let currentAssistantText = '';
   let reconnectDelay = 1000;
@@ -71,6 +73,18 @@
 
       case 'bridge_error':
         addMessage('error', msg.message);
+        break;
+
+      case 'auth_required':
+        showAuthPrompt(msg.message);
+        break;
+
+      case 'auth_url':
+        showAuthURL(msg.url, msg.message);
+        break;
+
+      case 'auth_status':
+        handleAuthStatus(msg);
         break;
     }
   }
@@ -277,6 +291,74 @@
     return result;
   }
 
+  // --- Auth flow ---
+
+  function showAuthPrompt(message) {
+    removeAuthUI();
+    loginBtn.style.display = 'inline-block';
+    var el = document.createElement('div');
+    el.className = 'msg msg-auth';
+    el.id = 'auth-prompt';
+    el.innerHTML =
+      '<div class="auth-message">' + escapeHtml(message) + '</div>' +
+      '<button class="btn-auth" onclick="window._startAuth()">Login with Claude</button>';
+    messagesEl.appendChild(el);
+    scrollToBottom();
+  }
+
+  function showAuthURL(url, message) {
+    removeAuthUI();
+    authPending = true;
+    var el = document.createElement('div');
+    el.className = 'msg msg-auth';
+    el.id = 'auth-prompt';
+    el.innerHTML =
+      '<div class="auth-message">' + escapeHtml(message) + '</div>' +
+      '<div class="auth-url"><a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">Open login page</a></div>' +
+      '<div class="auth-code-input">' +
+        '<input type="text" id="auth-code" placeholder="Paste authorization code here..." />' +
+        '<button class="btn-auth" onclick="window._submitAuthCode()">Submit</button>' +
+      '</div>';
+    messagesEl.appendChild(el);
+    scrollToBottom();
+    var codeInput = document.getElementById('auth-code');
+    if (codeInput) codeInput.focus();
+  }
+
+  function handleAuthStatus(msg) {
+    if (msg.status === 'success') {
+      authPending = false;
+      loginBtn.style.display = 'none';
+      removeAuthUI();
+      addMessage('system', msg.message);
+    } else if (msg.status === 'error') {
+      authPending = false;
+      removeAuthUI();
+      showAuthPrompt(msg.message);
+    } else if (msg.status === 'starting' || msg.status === 'completing') {
+      addMessage('system', msg.message);
+    }
+  }
+
+  function removeAuthUI() {
+    var existing = document.getElementById('auth-prompt');
+    if (existing) existing.remove();
+  }
+
+  window._startAuth = function() {
+    send({ type: 'auth_start' });
+    removeAuthUI();
+    addMessage('system', 'Starting login...');
+  };
+
+  window._submitAuthCode = function() {
+    var codeInput = document.getElementById('auth-code');
+    if (!codeInput) return;
+    var code = codeInput.value.trim();
+    if (!code) return;
+    send({ type: 'auth_code', message: code });
+  };
+
   // --- Input handling ---
 
   inputEl.addEventListener('keydown', function(e) {
@@ -296,6 +378,10 @@
 
   interruptBtn.addEventListener('click', function() {
     send({ type: 'interrupt' });
+  });
+
+  loginBtn.addEventListener('click', function() {
+    window._startAuth();
   });
 
   function sendMessage() {
