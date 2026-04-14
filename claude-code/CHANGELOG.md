@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.6
+
+- **Persist session message history**: Chat messages now survive page reloads, navigation, and device switches. The bridge records all conversation events in memory and replays them to new WebSocket clients on connect. History resets when the session is cleared or the addon restarts.
+
 ## 2.0.5
 
 - **Implement full OAuth PKCE flow in bridge**: Rather than wrapping `claude auth login` (which uses a local callback server with a mismatched redirect_uri), the bridge now handles the entire OAuth flow itself: generates PKCE code_verifier/challenge, builds the auth URL, and exchanges the code directly at Anthropic's token endpoint. This eliminates the redirect_uri mismatch that caused 400 errors on token exchange.
