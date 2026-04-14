@@ -49,6 +49,7 @@ type Bridge struct {
 	stdin     io.WriteCloser
 	working   bool
 	clients   map[*websocket.Conn]bool
+	history   []json.RawMessage // messages to replay on reconnect
 
 	// Auth flow state
 	authMu           sync.Mutex
@@ -238,6 +239,9 @@ func (b *Bridge) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"session": b.sessionID,
 	})
 
+	// Replay message history so the client sees the full conversation
+	b.replayHistory(conn)
+
 	// If not authenticated, tell this client immediately
 	if !b.cfg.APIKeySet && !b.isAuthenticated() {
 		conn.WriteJSON(map[string]interface{}{
@@ -418,6 +422,7 @@ func (b *Bridge) handleUserMessage(message string) {
 			log.Printf("Session %s not found, clearing and retrying without --resume", resumeID)
 			b.mu.Lock()
 			b.sessionID = ""
+			b.history = nil
 			b.mu.Unlock()
 			b.clearSessionID()
 			// Retry this message without --resume (recursive, but resumeID will be "" so no infinite loop)
@@ -447,6 +452,7 @@ func (b *Bridge) handleUserMessage(message string) {
 }
 
 // broadcast sends a message to all connected WebSocket clients.
+// Messages with replayable types are appended to history for new clients.
 func (b *Bridge) broadcast(msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -454,6 +460,11 @@ func (b *Bridge) broadcast(msg interface{}) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if shouldRecord(msg) {
+		b.history = append(b.history, json.RawMessage(data))
+	}
+
 	for conn := range b.clients {
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			log.Printf("WS write error: %v", err)
@@ -461,6 +472,36 @@ func (b *Bridge) broadcast(msg interface{}) {
 			delete(b.clients, conn)
 		}
 	}
+}
+
+func shouldRecord(msg interface{}) bool {
+	m, ok := msg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch m["type"] {
+	case "user_message", "claude_event", "bridge_error":
+		return true
+	}
+	return false
+}
+
+// replayHistory sends stored messages to a single client.
+func (b *Bridge) replayHistory(conn *websocket.Conn) {
+	b.mu.Lock()
+	msgs := make([]json.RawMessage, len(b.history))
+	copy(msgs, b.history)
+	b.mu.Unlock()
+
+	if len(msgs) == 0 {
+		return
+	}
+
+	wrapper, _ := json.Marshal(map[string]interface{}{
+		"type":     "message_history",
+		"messages": msgs,
+	})
+	conn.WriteMessage(websocket.TextMessage, wrapper)
 }
 
 func (b *Bridge) killProc() {

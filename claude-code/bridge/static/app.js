@@ -63,6 +63,10 @@
         if (!working) finishAssistant();
         break;
 
+      case 'message_history':
+        replayHistory(msg.messages);
+        break;
+
       case 'user_message':
         addMessage('user', msg.message);
         break;
@@ -87,6 +91,22 @@
         handleAuthStatus(msg);
         break;
     }
+  }
+
+  function replayHistory(messages) {
+    if (!messages || !messages.length) return;
+    messagesEl.innerHTML = '';
+    currentAssistantEl = null;
+    currentAssistantText = '';
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      if (typeof m === 'string') {
+        try { m = JSON.parse(m); } catch(e) { continue; }
+      }
+      handleMessage(m);
+    }
+    finishAssistant();
+    scrollToBottom();
   }
 
   function handleClaudeEvent(event) {
