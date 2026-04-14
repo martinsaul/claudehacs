@@ -3,18 +3,19 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,11 +51,10 @@ type Bridge struct {
 	clients   map[*websocket.Conn]bool
 
 	// Auth flow state
-	authMu        sync.Mutex
-	authProc      *exec.Cmd
-	authPending   bool   // true while waiting for user to paste code
-	authState     string // OAuth state parameter from the auth URL
-	authLocalPort int    // local port claude auth login is listening on
+	authMu           sync.Mutex
+	authPending      bool   // true while waiting for user to paste code
+	authState        string // OAuth state parameter
+	authCodeVerifier string // PKCE code_verifier
 }
 
 var upgrader = websocket.Upgrader{
@@ -76,9 +76,6 @@ func main() {
 	if !cfg.APIKeySet && cfg.KeepaliveHours > 0 {
 		go b.authKeepalive()
 	}
-
-	// Check auth status on startup
-	go b.checkAuthOnStartup()
 
 	// HTTP routes
 	mux := http.NewServeMux()
@@ -578,18 +575,14 @@ func (b *Bridge) checkAndRefreshAuth() {
 	}
 }
 
-// checkAuthOnStartup logs auth status at boot.
-func (b *Bridge) checkAuthOnStartup() {
-	if b.cfg.APIKeySet {
-		log.Printf("[auth] API key configured, skipping OAuth check")
-		return
-	}
-	if b.isAuthenticated() {
-		log.Printf("[auth] OAuth credentials found and valid")
-	} else {
-		log.Printf("[auth] No valid OAuth credentials found, clients will be prompted on connect")
-	}
-}
+// OAuth constants — extracted from the Claude CLI binary.
+const (
+	oauthClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	oauthAuthorizeURL = "https://claude.com/cai/oauth/authorize"
+	oauthTokenURL    = "https://platform.claude.com/v1/oauth/token"
+	oauthRedirectURI = "https://platform.claude.com/oauth/code/callback"
+	oauthScopes      = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+)
 
 // isAuthenticated checks if valid OAuth credentials exist.
 func (b *Bridge) isAuthenticated() bool {
@@ -606,14 +599,27 @@ func (b *Bridge) isAuthenticated() bool {
 	if err := json.Unmarshal(data, &creds); err != nil {
 		return false
 	}
-	// Check if token exists and hasn't expired
 	return creds.ClaudeAiOauth.ExpiresAt > time.Now().UnixMilli()
 }
 
-// handleAuthStart launches `claude auth login` and captures the OAuth URL.
-// Claude CLI starts a local HTTP server on a random port and waits for the
-// OAuth callback at /callback?code=X&state=Y. We extract the URL (with state),
-// find the local port, and store both so handleAuthCode can complete the flow.
+// generatePKCE creates a PKCE code_verifier and code_challenge (S256).
+func generatePKCE() (verifier, challenge string) {
+	buf := make([]byte, 32)
+	rand.Read(buf)
+	verifier = base64.RawURLEncoding.EncodeToString(buf)
+	h := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(h[:])
+	return
+}
+
+// generateState creates a random state parameter.
+func generateState() string {
+	buf := make([]byte, 32)
+	rand.Read(buf)
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+// handleAuthStart generates an OAuth URL with PKCE and sends it to the client.
 func (b *Bridge) handleAuthStart() {
 	b.authMu.Lock()
 	if b.authPending {
@@ -628,185 +634,39 @@ func (b *Bridge) handleAuthStart() {
 	b.authPending = true
 	b.authMu.Unlock()
 
-	defer func() {
-		b.authMu.Lock()
-		b.authPending = false
-		b.authProc = nil
-		b.authState = ""
-		b.authLocalPort = 0
-		b.authMu.Unlock()
-	}()
-
-	b.broadcast(map[string]interface{}{
-		"type":    "auth_status",
-		"status":  "starting",
-		"message": "Starting OAuth login...",
-	})
-
-	// Build the auth login command
-	var cmd *exec.Cmd
-	if b.cfg.UseGosu {
-		cmd = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir,
-			b.cfg.ClaudeBin, "auth", "login", "--claudeai")
-	} else {
-		cmd = exec.Command(b.cfg.ClaudeBin, "auth", "login", "--claudeai")
-	}
-	cmd.Env = append(os.Environ(),
-		"HOME="+b.cfg.HomeDir,
-		"BROWSER=/usr/bin/false", // Prevent browser open attempts
-	)
-
-	// Capture stdout+stderr via pipes
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("[auth] stdout pipe error: %v", err)
-		b.broadcast(map[string]interface{}{"type": "auth_status", "status": "error", "message": err.Error()})
-		return
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		log.Printf("[auth] stderr pipe error: %v", err)
-		b.broadcast(map[string]interface{}{"type": "auth_status", "status": "error", "message": err.Error()})
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("[auth] start error: %v", err)
-		b.broadcast(map[string]interface{}{
-			"type":    "auth_status",
-			"status":  "error",
-			"message": "Failed to start auth: " + err.Error(),
-		})
-		return
-	}
-
-	pid := cmd.Process.Pid
-	log.Printf("[auth] Spawned claude auth login (PID %d)", pid)
+	verifier, challenge := generatePKCE()
+	state := generateState()
 
 	b.authMu.Lock()
-	b.authProc = cmd
-	b.authMu.Unlock()
-
-	// Read output lines in background
-	outputCh := make(chan string, 50)
-	var outputCollector bytes.Buffer
-	var outputMu sync.Mutex
-	readPipe := func(r io.Reader) {
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			line := scanner.Text()
-			outputMu.Lock()
-			outputCollector.WriteString(line + "\n")
-			outputMu.Unlock()
-			outputCh <- line
-		}
-	}
-	go readPipe(stdoutPipe)
-	go readPipe(stderrPipe)
-
-	// Wait for the URL to appear
-	authURL := ""
-	deadline := time.After(15 * time.Second)
-	for authURL == "" {
-		select {
-		case <-deadline:
-			outputMu.Lock()
-			collected := outputCollector.String()
-			outputMu.Unlock()
-			log.Printf("[auth] Timed out waiting for URL. Output: %s", collected)
-			b.broadcast(map[string]interface{}{
-				"type":    "auth_status",
-				"status":  "error",
-				"message": "Timed out waiting for auth URL. Output: " + collected,
-			})
-			cmd.Process.Kill()
-			cmd.Wait()
-			return
-		case line := <-outputCh:
-			if url := extractAuthURL(line); url != "" {
-				authURL = url
-			}
-		}
-	}
-
-	// Extract state parameter from the URL
-	state := extractParam(authURL, "state")
-	if state == "" {
-		log.Printf("[auth] Could not extract state from URL")
-		b.broadcast(map[string]interface{}{
-			"type":    "auth_status",
-			"status":  "error",
-			"message": "Could not extract OAuth state from URL.",
-		})
-		cmd.Process.Kill()
-		cmd.Wait()
-		return
-	}
-
-	// Find the local port the CLI is listening on
-	localPort := findListeningPort(pid)
-	if localPort == 0 {
-		log.Printf("[auth] Could not find local listening port for PID %d", pid)
-		b.broadcast(map[string]interface{}{
-			"type":    "auth_status",
-			"status":  "error",
-			"message": "Could not find CLI callback port.",
-		})
-		cmd.Process.Kill()
-		cmd.Wait()
-		return
-	}
-
-	log.Printf("[auth] Got auth URL (state=%s, local port=%d)", state, localPort)
-
-	b.authMu.Lock()
+	b.authCodeVerifier = verifier
 	b.authState = state
-	b.authLocalPort = localPort
 	b.authMu.Unlock()
 
+	// Build the authorization URL
+	params := url.Values{}
+	params.Set("code", "true")
+	params.Set("client_id", oauthClientID)
+	params.Set("response_type", "code")
+	params.Set("redirect_uri", oauthRedirectURI)
+	params.Set("scope", oauthScopes)
+	params.Set("code_challenge", challenge)
+	params.Set("code_challenge_method", "S256")
+	params.Set("state", state)
+
+	authURL := oauthAuthorizeURL + "?" + params.Encode()
+
+	log.Printf("[auth] Generated OAuth URL (state=%s)", state)
 	b.broadcast(map[string]interface{}{
 		"type":    "auth_url",
 		"url":     authURL,
 		"message": "Open this URL in your browser, sign in, then paste the code below.",
 	})
-
-	// Wait for the process to exit (handleAuthCode will hit the local callback)
-	waitErr := cmd.Wait()
-	outputMu.Lock()
-	output := outputCollector.String()
-	outputMu.Unlock()
-
-	if waitErr != nil {
-		log.Printf("[auth] claude auth login exited with error: %v (output: %s)", waitErr, output)
-		if b.isAuthenticated() {
-			log.Printf("[auth] Despite error exit, credentials are valid")
-			b.broadcast(map[string]interface{}{
-				"type":    "auth_status",
-				"status":  "success",
-				"message": "Authentication successful!",
-			})
-			return
-		}
-		b.broadcast(map[string]interface{}{
-			"type":    "auth_status",
-			"status":  "error",
-			"message": "Auth failed: " + strings.TrimSpace(output),
-		})
-		return
-	}
-
-	log.Printf("[auth] claude auth login completed successfully")
-	b.broadcast(map[string]interface{}{
-		"type":    "auth_status",
-		"status":  "success",
-		"message": "Authentication successful!",
-	})
 }
 
-// handleAuthCode submits the authorization code to the CLI's local callback server.
-func (b *Bridge) handleAuthCode(code string) {
-	code = strings.TrimSpace(code)
-	if code == "" {
+// handleAuthCode exchanges the authorization code for tokens via Anthropic's token endpoint.
+func (b *Bridge) handleAuthCode(input string) {
+	input = strings.TrimSpace(input)
+	if input == "" {
 		b.broadcast(map[string]interface{}{
 			"type":    "auth_status",
 			"status":  "error",
@@ -817,11 +677,11 @@ func (b *Bridge) handleAuthCode(code string) {
 
 	b.authMu.Lock()
 	pending := b.authPending
-	state := b.authState
-	port := b.authLocalPort
+	verifier := b.authCodeVerifier
+	expectedState := b.authState
 	b.authMu.Unlock()
 
-	if !pending || state == "" || port == 0 {
+	if !pending || verifier == "" || expectedState == "" {
 		b.broadcast(map[string]interface{}{
 			"type":    "auth_status",
 			"status":  "error",
@@ -830,150 +690,131 @@ func (b *Bridge) handleAuthCode(code string) {
 		return
 	}
 
-	log.Printf("[auth] Submitting code to local callback (port %d, state %s)", port, state)
+	// Parse code#state format
+	code := input
+	if idx := strings.Index(input, "#"); idx >= 0 {
+		code = input[:idx]
+		pastedState := input[idx+1:]
+		if pastedState != expectedState {
+			log.Printf("[auth] State mismatch: expected %s, got %s", expectedState, pastedState)
+			b.broadcast(map[string]interface{}{
+				"type":    "auth_status",
+				"status":  "error",
+				"message": "State mismatch. Please start a new login.",
+			})
+			b.authMu.Lock()
+			b.authPending = false
+			b.authMu.Unlock()
+			return
+		}
+	}
+
+	log.Printf("[auth] Exchanging authorization code for tokens")
 	b.broadcast(map[string]interface{}{
 		"type":    "auth_status",
 		"status":  "completing",
-		"message": "Submitting code...",
+		"message": "Exchanging code for tokens...",
 	})
 
-	// The code may contain # (fragment separator) — must be URL-encoded.
-	// Also strip any trailing #state the user may have pasted from the
-	// platform callback page (the state is already known).
-	if idx := strings.Index(code, "#"); idx >= 0 {
-		code = code[:idx]
+	// Exchange the code for tokens
+	tokenReq := map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"redirect_uri":  oauthRedirectURI,
+		"client_id":     oauthClientID,
+		"code_verifier": verifier,
+		"state":         expectedState,
 	}
+	reqBody, _ := json.Marshal(tokenReq)
 
-	// Hit the CLI's local callback endpoint
-	callbackURL := fmt.Sprintf("http://localhost:%d/callback?code=%s&state=%s",
-		port, url.QueryEscape(code), url.QueryEscape(state))
-	resp, err := http.Get(callbackURL)
+	resp, err := http.Post(oauthTokenURL, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		log.Printf("[auth] Callback request failed: %v", err)
+		log.Printf("[auth] Token exchange request failed: %v", err)
 		b.broadcast(map[string]interface{}{
 			"type":    "auth_status",
 			"status":  "error",
-			"message": "Failed to submit code: " + err.Error(),
+			"message": "Token exchange failed: " + err.Error(),
 		})
+		b.authMu.Lock()
+		b.authPending = false
+		b.authMu.Unlock()
 		return
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	bodyStr := strings.TrimSpace(string(body))
-	log.Printf("[auth] Callback response: %d %s", resp.StatusCode, bodyStr)
 
-	if resp.StatusCode != http.StatusOK && bodyStr != "" {
-		// The CLI will exit and handleAuthStart will broadcast the final status
-		log.Printf("[auth] Callback returned error: %s", bodyStr)
-	}
-	// The handleAuthStart goroutine waiting on cmd.Wait() will handle the result
-}
-
-// extractAuthURL finds the OAuth URL in claude auth login output.
-func extractAuthURL(output string) string {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if idx := strings.Index(line, "https://claude.com/"); idx >= 0 {
-			return strings.TrimSpace(line[idx:])
-		}
-		if idx := strings.Index(line, "https://console.anthropic.com/"); idx >= 0 {
-			return strings.TrimSpace(line[idx:])
-		}
-	}
-	return ""
-}
-
-// extractParam extracts a query parameter value from a URL string.
-func extractParam(rawURL, param string) string {
-	re := regexp.MustCompile(param + `=([A-Za-z0-9_\-]+)`)
-	m := re.FindStringSubmatch(rawURL)
-	if len(m) >= 2 {
-		return m[1]
-	}
-	return ""
-}
-
-// findListeningPort finds a TCP port that the given PID is listening on.
-// It reads /proc/net/tcp6 and /proc/<pid>/fd to correlate.
-func findListeningPort(pid int) int {
-	// Read listening sockets for this process from /proc/<pid>/fd
-	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
-	entries, err := os.ReadDir(fdDir)
-	if err != nil {
-		log.Printf("[auth] Cannot read %s: %v", fdDir, err)
-		return findListeningPortFallback(pid)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[auth] Token exchange failed: %d %s", resp.StatusCode, string(body))
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": fmt.Sprintf("Token exchange failed (HTTP %d). Try again.", resp.StatusCode),
+		})
+		b.authMu.Lock()
+		b.authPending = false
+		b.authMu.Unlock()
+		return
 	}
 
-	// Collect inode numbers for sockets owned by this process
-	socketInodes := make(map[string]bool)
-	for _, e := range entries {
-		link, err := os.Readlink(filepath.Join(fdDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if strings.HasPrefix(link, "socket:[") {
-			inode := strings.TrimPrefix(strings.TrimSuffix(link, "]"), "socket:[")
-			socketInodes[inode] = true
-		}
+	// Parse the token response
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Scope        string `json:"scope"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		log.Printf("[auth] Failed to parse token response: %v", err)
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Failed to parse token response.",
+		})
+		b.authMu.Lock()
+		b.authPending = false
+		b.authMu.Unlock()
+		return
 	}
 
-	if len(socketInodes) == 0 {
-		return findListeningPortFallback(pid)
+	// Write credentials in the format Claude CLI expects
+	expiresAt := time.Now().UnixMilli() + tokenResp.ExpiresIn*1000
+	creds := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken":  tokenResp.AccessToken,
+			"refreshToken": tokenResp.RefreshToken,
+			"expiresAt":    expiresAt,
+			"scopes":       tokenResp.Scope,
+		},
+	}
+	credsJSON, _ := json.MarshalIndent(creds, "", "  ")
+	credsDir := filepath.Join(b.cfg.HomeDir, ".claude")
+	os.MkdirAll(credsDir, 0700)
+	credsPath := filepath.Join(credsDir, ".credentials.json")
+
+	if err := os.WriteFile(credsPath, credsJSON, 0600); err != nil {
+		log.Printf("[auth] Failed to write credentials: %v", err)
+		b.broadcast(map[string]interface{}{
+			"type":    "auth_status",
+			"status":  "error",
+			"message": "Failed to save credentials: " + err.Error(),
+		})
+		b.authMu.Lock()
+		b.authPending = false
+		b.authMu.Unlock()
+		return
 	}
 
-	// Parse /proc/net/tcp6 (and tcp) for listening sockets matching our inodes
-	for _, tcpFile := range []string{"/proc/net/tcp6", "/proc/net/tcp"} {
-		data, err := os.ReadFile(tcpFile)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 10 {
-				continue
-			}
-			// State 0A = LISTEN
-			if fields[3] != "0A" {
-				continue
-			}
-			inode := fields[9]
-			if socketInodes[inode] {
-				// Parse port from local_address (field 1): addr:port in hex
-				parts := strings.Split(fields[1], ":")
-				if len(parts) == 2 {
-					portHex := parts[len(parts)-1]
-					port, err := strconv.ParseInt(portHex, 16, 32)
-					if err == nil && port > 0 {
-						return int(port)
-					}
-				}
-			}
-		}
-	}
+	log.Printf("[auth] Authentication successful, credentials saved to %s", credsPath)
+	b.broadcast(map[string]interface{}{
+		"type":    "auth_status",
+		"status":  "success",
+		"message": "Authentication successful!",
+	})
 
-	return findListeningPortFallback(pid)
-}
-
-// findListeningPortFallback uses net.Dial probing as a last resort.
-func findListeningPortFallback(pid int) int {
-	// Try common ephemeral port range - scan quickly
-	log.Printf("[auth] Falling back to port scan for PID %d", pid)
-	for port := 30000; port < 65535; port++ {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			// Verify it responds like the Claude callback server
-			resp, err := http.Get(fmt.Sprintf("http://localhost:%d/callback?code=probe&state=probe", port))
-			if err == nil {
-				body, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if strings.Contains(string(body), "Invalid state") {
-					log.Printf("[auth] Found CLI callback server on port %d via fallback", port)
-					return port
-				}
-			}
-		}
-	}
-	return 0
+	b.authMu.Lock()
+	b.authPending = false
+	b.authCodeVerifier = ""
+	b.authState = ""
+	b.authMu.Unlock()
 }
