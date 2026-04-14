@@ -2,7 +2,7 @@
 
 ## 2.0.5
 
-- **Fix auth code submission**: `claude auth login` does not read the authorization code from stdin -- it starts a local HTTP server and expects the code at `/callback?code=X&state=Y`. The bridge now finds the CLI's listening port via `/proc/net/tcp6` and submits the code by hitting the local callback endpoint.
+- **Implement full OAuth PKCE flow in bridge**: Rather than wrapping `claude auth login` (which uses a local callback server with a mismatched redirect_uri), the bridge now handles the entire OAuth flow itself: generates PKCE code_verifier/challenge, builds the auth URL, and exchanges the code directly at Anthropic's token endpoint. This eliminates the redirect_uri mismatch that caused 400 errors on token exchange.
 
 ## 2.0.4
 
