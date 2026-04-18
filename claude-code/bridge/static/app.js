@@ -7,6 +7,9 @@
   const statusEl = document.getElementById('status');
   const interruptBtn = document.getElementById('interrupt-btn');
   const loginBtn = document.getElementById('login-btn');
+  const newBtn = document.getElementById('new-btn');
+
+  const base = location.pathname.replace(/\/$/, '');
 
   let ws = null;
   let working = false;
@@ -19,7 +22,6 @@
 
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const base = location.pathname.replace(/\/$/, '');
     ws = new WebSocket(proto + '//' + location.host + base + '/ws');
 
     ws.onopen = function() {
@@ -65,6 +67,15 @@
 
       case 'message_history':
         replayHistory(msg.messages);
+        break;
+
+      case 'session_reset':
+        messagesEl.innerHTML = '';
+        working = false;
+        currentAssistantEl = null;
+        currentAssistantText = '';
+        interruptBtn.disabled = true;
+        setStatus('connected');
         break;
 
       case 'user_message':
@@ -402,6 +413,11 @@
 
   loginBtn.addEventListener('click', function() {
     window._startAuth();
+  });
+
+  newBtn.addEventListener('click', function() {
+    fetch(base + '/new-session', { method: 'POST' })
+      .catch(function(err) { console.error('new-session error:', err); });
   });
 
   function sendMessage() {

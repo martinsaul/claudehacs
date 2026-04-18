@@ -27,16 +27,16 @@ import (
 
 // Config holds addon configuration read from environment.
 type Config struct {
-	Port            int
-	BasePath        string
-	ClaudeBin       string
-	WorkDir         string
-	HomeDir         string
-	SkipPerms       bool
-	UseGosu         bool
-	SystemPrompt    string
-	KeepaliveHours  int
-	APIKeySet       bool
+	Port           int
+	BasePath       string
+	ClaudeBin      string
+	WorkDir        string
+	HomeDir        string
+	SkipPerms      bool
+	UseGosu        bool
+	SystemPrompt   string
+	KeepaliveHours int
+	APIKeySet      bool
 }
 
 // Bridge manages the Claude subprocess and WebSocket clients.
@@ -44,12 +44,13 @@ type Bridge struct {
 	cfg       Config
 	sessionID string
 
-	mu        sync.Mutex
-	proc      *exec.Cmd
-	stdin     io.WriteCloser
-	working   bool
-	clients   map[*websocket.Conn]bool
-	history   []json.RawMessage // messages to replay on reconnect
+	mu          sync.Mutex
+	proc        *exec.Cmd
+	stdin       io.WriteCloser
+	working     bool
+	clients     map[*websocket.Conn]bool
+	history     []json.RawMessage // messages to replay on reconnect
+	historyPath string            // path to persisted history file
 
 	// Auth flow state
 	authMu           sync.Mutex
@@ -66,12 +67,16 @@ func main() {
 	cfg := loadConfig()
 
 	b := &Bridge{
-		cfg:     cfg,
-		clients: make(map[*websocket.Conn]bool),
+		cfg:         cfg,
+		clients:     make(map[*websocket.Conn]bool),
+		historyPath: filepath.Join(cfg.HomeDir, ".claude-bridge-history.json"),
 	}
 
 	// Load saved session ID (may be empty if first run)
 	b.sessionID = b.loadSessionID()
+
+	// Load persisted chat history
+	b.history = b.loadHistory()
 
 	// Auth keepalive
 	if !cfg.APIKeySet && cfg.KeepaliveHours > 0 {
@@ -88,6 +93,7 @@ func main() {
 	mux.HandleFunc(base+"/ws", b.handleWebSocket)
 	mux.HandleFunc(base+"/interrupt", b.handleInterrupt)
 	mux.HandleFunc(base+"/health", b.handleHealth)
+	mux.HandleFunc(base+"/new-session", b.handleNewSession)
 	mux.Handle(base+"/static/", http.StripPrefix(base+"/static/", fs))
 	mux.HandleFunc(base+"/", b.handleIndex(staticDir))
 
@@ -168,6 +174,33 @@ func (b *Bridge) clearSessionID() {
 	os.Remove(path)
 }
 
+// loadHistory reads persisted chat history from disk.
+func (b *Bridge) loadHistory() []json.RawMessage {
+	data, err := os.ReadFile(b.historyPath)
+	if err != nil {
+		return nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("[history] parse error, starting fresh: %v", err)
+		return nil
+	}
+	log.Printf("[history] Loaded %d entries from disk", len(entries))
+	return entries
+}
+
+// saveHistoryLocked writes history to disk. Must be called with b.mu held.
+func (b *Bridge) saveHistoryLocked() {
+	data, err := json.Marshal(b.history)
+	if err != nil {
+		log.Printf("[history] marshal error: %v", err)
+		return
+	}
+	if err := os.WriteFile(b.historyPath, data, 0644); err != nil {
+		log.Printf("[history] write error: %v", err)
+	}
+}
+
 // handleIndex serves the chat UI.
 func (b *Bridge) handleIndex(staticDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +239,39 @@ func (b *Bridge) handleInterrupt(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Write([]byte(`{"ok":false,"reason":"no process"}`))
 	}
+}
+
+// handleNewSession resets to a fresh Claude conversation.
+func (b *Bridge) handleNewSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	b.mu.Lock()
+	// Kill current process if any
+	if b.proc != nil && b.proc.Process != nil {
+		b.proc.Process.Signal(syscall.SIGTERM)
+	}
+	b.working = false
+	b.proc = nil
+	b.stdin = nil
+	b.sessionID = ""
+	b.history = nil
+	b.mu.Unlock()
+
+	b.clearSessionID()
+	os.Remove(b.historyPath)
+
+	log.Printf("Session cleared by user request")
+
+	// Notify all clients
+	b.broadcast(map[string]interface{}{
+		"type": "session_reset",
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":true}`))
 }
 
 // handleWebSocket upgrades to WS and relays messages.
@@ -425,6 +491,7 @@ func (b *Bridge) handleUserMessage(message string) {
 			b.history = nil
 			b.mu.Unlock()
 			b.clearSessionID()
+			os.Remove(b.historyPath)
 			// Retry this message without --resume (recursive, but resumeID will be "" so no infinite loop)
 			b.mu.Lock()
 			b.working = false
@@ -463,6 +530,7 @@ func (b *Bridge) broadcast(msg interface{}) {
 
 	if shouldRecord(msg) {
 		b.history = append(b.history, json.RawMessage(data))
+		b.saveHistoryLocked()
 	}
 
 	for conn := range b.clients {
@@ -523,6 +591,9 @@ func (b *Bridge) authKeepalive() {
 	}
 	checkInterval := 30 * time.Minute
 	log.Printf("Auth keepalive active (check every %v, refresh when ≤2h remaining)", checkInterval)
+
+	// Check immediately on startup — catches already-expired tokens before first tick
+	b.checkAndRefreshAuth()
 
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
@@ -597,15 +668,17 @@ func (b *Bridge) checkAndRefreshAuth() {
 		return
 	}
 
-	// Fallback: force an API call
+	// Fallback: force an API call to trigger token refresh.
+	// --no-session-persistence is intentionally omitted so any refreshed token
+	// is written back to credentials on disk.
 	log.Printf("[auth-keepalive] auth status didn't refresh, forcing API call...")
 	var cmd2 *exec.Cmd
 	if b.cfg.UseGosu {
 		cmd2 = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir, b.cfg.ClaudeBin,
-			"--print", "--output-format", "json", "--no-session-persistence", "ok")
+			"--print", "--output-format", "json", "ok")
 	} else {
 		cmd2 = exec.Command(b.cfg.ClaudeBin,
-			"--print", "--output-format", "json", "--no-session-persistence", "ok")
+			"--print", "--output-format", "json", "ok")
 	}
 	cmd2.Env = append(os.Environ(), "HOME="+b.cfg.HomeDir)
 	out2, err2 := cmd2.CombinedOutput()
@@ -618,11 +691,11 @@ func (b *Bridge) checkAndRefreshAuth() {
 
 // OAuth constants — extracted from the Claude CLI binary.
 const (
-	oauthClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	oauthClientID     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	oauthAuthorizeURL = "https://claude.com/cai/oauth/authorize"
-	oauthTokenURL    = "https://platform.claude.com/v1/oauth/token"
-	oauthRedirectURI = "https://platform.claude.com/oauth/code/callback"
-	oauthScopes      = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	oauthTokenURL     = "https://platform.claude.com/v1/oauth/token"
+	oauthRedirectURI  = "https://platform.claude.com/oauth/code/callback"
+	oauthScopes       = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
 // isAuthenticated checks if valid OAuth credentials exist.

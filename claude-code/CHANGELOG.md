@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0
+
+- **New conversation button**: "New" button in the header starts a fresh Claude session — clears chat history, resets session ID, and notifies all connected clients immediately
+- **Chat history persists across restarts**: conversation history is now written to `/data/.claude-bridge-history.json` and loaded on bridge startup, so restarting or rebuilding the addon no longer wipes the chat
+- **Auth keepalive startup fix**: token expiry check now runs immediately on bridge startup (previously waited 30 minutes before the first check, missing already-expired tokens); `--no-session-persistence` removed from fallback refresh call so refreshed tokens are written back to disk
+
 ## 2.0.6
 
 - **Persist session message history**: Chat messages now survive page reloads, navigation, and device switches. The bridge records all conversation events in memory and replays them to new WebSocket clients on connect. History resets when the session is cleared or the addon restarts.
