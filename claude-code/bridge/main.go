@@ -94,6 +94,7 @@ func main() {
 	mux.HandleFunc(base+"/interrupt", b.handleInterrupt)
 	mux.HandleFunc(base+"/health", b.handleHealth)
 	mux.HandleFunc(base+"/new-session", b.handleNewSession)
+	mux.HandleFunc(base+"/api/prompt", b.handleAPIPrompt)
 	mux.Handle(base+"/static/", http.StripPrefix(base+"/static/", fs))
 	mux.HandleFunc(base+"/", b.handleIndex(staticDir))
 
@@ -272,6 +273,90 @@ func (b *Bridge) handleNewSession(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true}`))
+}
+
+// handleAPIPrompt provides a synchronous HTTP API for running Claude prompts.
+// Used by Autobots and other HA integrations. Returns the full text response.
+func (b *Bridge) handleAPIPrompt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Prompt       string `json:"prompt"`
+		SystemPrompt string `json:"system_prompt,omitempty"`
+		MaxTurns     int    `json:"max_turns,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Prompt == "" {
+		http.Error(w, `{"error":"prompt is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if !b.cfg.APIKeySet && !b.isAuthenticated() {
+		http.Error(w, `{"error":"not authenticated"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Build claude command for one-shot prompt
+	args := []string{
+		"--print",
+		"--output-format", "json",
+	}
+	if b.cfg.SkipPerms {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	if req.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", req.SystemPrompt)
+	} else if b.cfg.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", b.cfg.SystemPrompt)
+	}
+	if req.MaxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(req.MaxTurns))
+	}
+	args = append(args, req.Prompt)
+
+	cmd := exec.Command(b.cfg.ClaudeBin, args...)
+	cmd.Dir = b.cfg.WorkDir
+	cmd.Env = append(os.Environ(),
+		"HOME="+b.cfg.HomeDir,
+		"TERM=dumb",
+	)
+
+	log.Printf("[api] Running prompt (%d chars)", len(req.Prompt))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[api] Claude exited with error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		errResp := map[string]string{
+			"error":  "claude failed",
+			"detail": string(output),
+		}
+		json.NewEncoder(w).Encode(errResp)
+		return
+	}
+
+	// Parse the JSON output to extract the result text
+	var result struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		// If we can't parse as JSON, return raw output
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]string{"text": string(output)}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]string{"text": result.Result}
+	json.NewEncoder(w).Encode(resp)
+	log.Printf("[api] Prompt completed (%d chars response)", len(result.Result))
 }
 
 // handleWebSocket upgrades to WS and relays messages.
@@ -590,38 +675,70 @@ func (b *Bridge) authKeepalive() {
 		return
 	}
 	checkInterval := 30 * time.Minute
-	log.Printf("Auth keepalive active (check every %v, refresh when ≤2h remaining)", checkInterval)
+	refreshThreshold := 12 * time.Hour
+	log.Printf("Auth keepalive active (check every %v, refresh when ≤%v remaining)", checkInterval, refreshThreshold)
 
 	// Check immediately on startup — catches already-expired tokens before first tick
-	b.checkAndRefreshAuth()
+	b.checkAndRefreshAuth(refreshThreshold)
 
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		b.checkAndRefreshAuth()
+		b.checkAndRefreshAuth(refreshThreshold)
 	}
 }
 
-func (b *Bridge) checkAndRefreshAuth() {
-	credsPath := filepath.Join(b.cfg.HomeDir, ".claude", ".credentials.json")
-	data, err := os.ReadFile(credsPath)
-	if err != nil {
-		log.Printf("[auth-keepalive] Cannot read credentials: %v", err)
+// readCredentials reads and parses the OAuth credentials file.
+func (b *Bridge) readCredentials() (credsPath string, accessToken, refreshToken string, expiresAt int64, err error) {
+	credsPath = filepath.Join(b.cfg.HomeDir, ".claude", ".credentials.json")
+	data, readErr := os.ReadFile(credsPath)
+	if readErr != nil {
+		err = readErr
 		return
 	}
 
 	var creds struct {
 		ClaudeAiOauth struct {
-			ExpiresAt int64 `json:"expiresAt"`
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresAt    int64  `json:"expiresAt"`
+			Scopes       string `json:"scopes"`
 		} `json:"claudeAiOauth"`
 	}
-	if err := json.Unmarshal(data, &creds); err != nil {
-		log.Printf("[auth-keepalive] Cannot parse credentials: %v", err)
+	if jsonErr := json.Unmarshal(data, &creds); jsonErr != nil {
+		err = jsonErr
 		return
 	}
 
-	expiresAt := creds.ClaudeAiOauth.ExpiresAt
+	accessToken = creds.ClaudeAiOauth.AccessToken
+	refreshToken = creds.ClaudeAiOauth.RefreshToken
+	expiresAt = creds.ClaudeAiOauth.ExpiresAt
+	return
+}
+
+// writeCredentials writes new OAuth tokens to the credentials file.
+func (b *Bridge) writeCredentials(credsPath, accessToken, refreshToken string, expiresAt int64) error {
+	// Read existing file to preserve any extra fields
+	creds := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken":  accessToken,
+			"refreshToken": refreshToken,
+			"expiresAt":    expiresAt,
+			"scopes":       oauthScopes,
+		},
+	}
+	credsJSON, _ := json.MarshalIndent(creds, "", "  ")
+	return os.WriteFile(credsPath, credsJSON, 0600)
+}
+
+func (b *Bridge) checkAndRefreshAuth(threshold time.Duration) {
+	credsPath, _, refreshToken, expiresAt, err := b.readCredentials()
+	if err != nil {
+		log.Printf("[auth-keepalive] Cannot read credentials: %v", err)
+		return
+	}
+
 	if expiresAt == 0 {
 		log.Printf("[auth-keepalive] No OAuth token found")
 		return
@@ -629,64 +746,74 @@ func (b *Bridge) checkAndRefreshAuth() {
 
 	nowMs := time.Now().UnixMilli()
 	remainingMs := expiresAt - nowMs
-	remainingHr := remainingMs / 3_600_000
+	thresholdMs := threshold.Milliseconds()
 
-	if remainingMs > 2*3_600_000 {
+	if remainingMs > thresholdMs {
+		remainingHr := remainingMs / 3_600_000
 		log.Printf("[auth-keepalive] Token valid for ~%dh, no action needed", remainingHr)
 		return
 	}
 
-	log.Printf("[auth-keepalive] Token expires in ~%dh, triggering refresh...", remainingHr)
-
-	// Try auth status first
-	var cmd *exec.Cmd
-	if b.cfg.UseGosu {
-		cmd = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir, b.cfg.ClaudeBin, "auth", "status", "--json")
+	if remainingMs <= 0 {
+		log.Printf("[auth-keepalive] Token EXPIRED %dh ago, attempting refresh...",
+			(-remainingMs)/3_600_000)
 	} else {
-		cmd = exec.Command(b.cfg.ClaudeBin, "auth", "status", "--json")
-	}
-	cmd.Env = append(os.Environ(), "HOME="+b.cfg.HomeDir)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("[auth-keepalive] auth status failed: %v: %s", err, string(output))
-	} else {
-		log.Printf("[auth-keepalive] auth status OK")
+		log.Printf("[auth-keepalive] Token expires in ~%dh, refreshing...",
+			remainingMs/3_600_000)
 	}
 
-	// Check if token was actually refreshed
-	data2, _ := os.ReadFile(credsPath)
-	var creds2 struct {
-		ClaudeAiOauth struct {
-			ExpiresAt int64 `json:"expiresAt"`
-		} `json:"claudeAiOauth"`
-	}
-	json.Unmarshal(data2, &creds2)
-
-	if creds2.ClaudeAiOauth.ExpiresAt > expiresAt {
-		log.Printf("[auth-keepalive] Token refreshed successfully (new expiry in ~%dh)",
-			(creds2.ClaudeAiOauth.ExpiresAt-nowMs)/3_600_000)
+	if refreshToken == "" {
+		log.Printf("[auth-keepalive] No refresh_token available, cannot refresh")
 		return
 	}
 
-	// Fallback: force an API call to trigger token refresh.
-	// --no-session-persistence is intentionally omitted so any refreshed token
-	// is written back to credentials on disk.
-	log.Printf("[auth-keepalive] auth status didn't refresh, forcing API call...")
-	var cmd2 *exec.Cmd
-	if b.cfg.UseGosu {
-		cmd2 = exec.Command("gosu", "claude", "env", "HOME="+b.cfg.HomeDir, b.cfg.ClaudeBin,
-			"--print", "--output-format", "json", "ok")
-	} else {
-		cmd2 = exec.Command(b.cfg.ClaudeBin,
-			"--print", "--output-format", "json", "ok")
+	// Use the refresh_token grant directly against the OAuth token endpoint
+	tokenReq := map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     oauthClientID,
 	}
-	cmd2.Env = append(os.Environ(), "HOME="+b.cfg.HomeDir)
-	out2, err2 := cmd2.CombinedOutput()
-	if err2 != nil {
-		log.Printf("[auth-keepalive] API call fallback failed: %v: %s", err2, string(out2))
-	} else {
-		log.Printf("[auth-keepalive] API call succeeded, token should be refreshed")
+	reqBody, _ := json.Marshal(tokenReq)
+
+	resp, err := http.Post(oauthTokenURL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		log.Printf("[auth-keepalive] Refresh request failed: %v", err)
+		return
 	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[auth-keepalive] Refresh failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return
+	}
+
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		log.Printf("[auth-keepalive] Failed to parse refresh response: %v", err)
+		return
+	}
+
+	newExpiresAt := time.Now().UnixMilli() + tokenResp.ExpiresIn*1000
+
+	// Use the new refresh_token if provided (token rotation), otherwise keep the old one
+	newRefreshToken := refreshToken
+	if tokenResp.RefreshToken != "" {
+		newRefreshToken = tokenResp.RefreshToken
+	}
+
+	if err := b.writeCredentials(credsPath, tokenResp.AccessToken, newRefreshToken, newExpiresAt); err != nil {
+		log.Printf("[auth-keepalive] Failed to write refreshed credentials: %v", err)
+		return
+	}
+
+	newRemainingHr := (newExpiresAt - time.Now().UnixMilli()) / 3_600_000
+	log.Printf("[auth-keepalive] Token refreshed successfully (new expiry in ~%dh)", newRemainingHr)
 }
 
 // OAuth constants — extracted from the Claude CLI binary.
